@@ -1,0 +1,14 @@
+CFL:
+.99
+
+RBF type: (0 TPS, 1 MQ, 2 IMQ)
+1
+
+shape parameter coefficient MQ (c = beta * r_av), beta: (beta is beta if tps is on)
+8
+
+simulation end time (seconds):
+86400
+
+print step:
+2
