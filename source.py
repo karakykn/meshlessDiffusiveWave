@@ -34,20 +34,23 @@ class Network(object):
             self.calcOrder = [0]
             self.segUpstreamInfo = defaultdict(list)
             self.segDownstreamInfo = defaultdict(list)
+            self.downStreams = []
+            self.upStreams = []
         else:
             self.queSegments()
+
+            self.uppermostStreams = np.unique(self.network)
+            self.downermostStream = np.unique(self.network)
+            remove_vals = np.unique(np.atleast_2d(self.network)[:, 1])
+            mask = ~np.isin(self.uppermostStreams, remove_vals)
+            self.downStreams = self.uppermostStreams[~mask]
+            self.uppermostStreams = self.uppermostStreams[mask]
+            remove_vals = np.unique(np.atleast_2d(self.network)[:, 0])
+            mask = ~np.isin(self.downermostStream, remove_vals)
+            self.upStreams = self.downermostStream[~mask]
+            self.downermostStream = self.downermostStream[mask]
         self.junction_downs = [k for k, v in self.segUpstreamInfo.items() if v]
 
-        self.uppermostStreams = np.unique(self.network)
-        self.downermostStream = np.unique(self.network)
-        remove_vals = np.unique(self.network[:,1])
-        mask = ~np.isin(self.uppermostStreams, remove_vals)
-        self.downStreams = self.uppermostStreams[~mask]
-        self.uppermostStreams = self.uppermostStreams[mask]
-        remove_vals = np.unique(self.network[:, 0])
-        mask = ~np.isin(self.downermostStream, remove_vals)
-        self.upStreams = self.downermostStream[~mask]
-        self.downermostStream = self.downermostStream[mask]
         self.reset_junctions()
 
     def clean_run_directories(self):
