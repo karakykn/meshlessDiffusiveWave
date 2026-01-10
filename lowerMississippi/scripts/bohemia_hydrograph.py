@@ -12,7 +12,7 @@ df.loc[df['Stage (Ft)'] == 'M', 'Stage (Ft)'] = 0
 limS = 5.74
 mask = df['Stage (Ft)'].astype(float) > limS
 df['Q'] = df_a['Q']
-peak = 50000 * 0.02831683199881
+peak = 40000 * 0.02831683199881
 pwr = 3/2
 df.loc[mask, 'Q'] = peak * (df['Stage (Ft)'].astype(float) - limS) ** pwr / (df['Stage (Ft)'].astype(float).max() - limS) ** pwr
 df_bohemia['Q'] = -df['Q']

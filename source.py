@@ -22,6 +22,7 @@ class Network(object):
         self.simEndTime = float(lines[10][:-1])
         self.time = 0
         self.printStep = int(lines[13][:-1])
+        self.dsbcSpec = int(lines[16][:-1])
 
         file.close()
 
@@ -152,11 +153,9 @@ class Network(object):
 
 
                 for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
+                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
                         '''rating curve for the most downstream boundary'''
                         self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     else:
                         self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     self.segments[i].solveSeg_h5()
@@ -174,7 +173,9 @@ class Network(object):
                     for i in range(self.num_segments):
                         np.savetxt(f"{self.caseName}/segment{i}/run/0/h", self.segments[i].h[:])
                         # np.savetxt(f"{self.caseName}/segment{i}/run/0/Q", self.segments[i].Q[:])
-                        np.savetxt(f'{self.caseName}/segment{i}/geo/boundary_h', np.array([[0, self.segments[i].h[-1]]]))
+                        dummy = np.atleast_2d(np.loadtxt(f'{self.caseName}/segment{i}/geo/boundary_h'))
+                        dummy[0, :] = np.array([[0, self.segments[i].h[-1]]])
+                        np.savetxt(f'{self.caseName}/segment{i}/geo/boundary_h', dummy)
                         Qini = np.loadtxt(f"{self.caseName}/segment{i}/run/0/Q")
                         rmse = np.sqrt(np.sum((self.segments[i].Q - Qini) ** 2 / len(Qini)))
                         print(f'Simulation warmed up in {iter} iterations. Deviation in Q of channel {i}: {rmse:.6f}')
@@ -295,11 +296,9 @@ class Network(object):
                         self.update_junction_Q(self.segments[i].Q[-1], j)
 
                 for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
+                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
                         '''rating curve for the most downstream boundary'''
                         self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],self.segments[i].bar_params[-1][1, :], self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     else:
                         self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     self.segments[i].solveSeg_h5()
@@ -329,11 +328,9 @@ class Network(object):
                             self.update_junction_Q(self.segments[i].Q[-1], j)
 
                     for i in self.calcOrder[::-1]:
-                        if i == self.calcOrder[-1]:
+                        if i == self.calcOrder[-1] and self.dsbcSpec == 0:
                             '''rating curve for the most downstream boundary'''
                             self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                            '''fixed flow depth for the most dwnstream boundary'''
-                            # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                         else:
                             self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                         self.segments[i].solveSeg_h5()

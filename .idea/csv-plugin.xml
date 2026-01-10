@@ -10,6 +10,13 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="/2008flood_stLouis/data/hydros/saverton_stage_mississippi.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="/lowerMississippi/data/fort_stage.csv">
           <value>
             <Attribute>
@@ -18,6 +25,13 @@
           </value>
         </entry>
         <entry key="/lowerMississippi/data/fromTarbert_edit 1 1.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/lowerMississippi/data/headofpasses_stage.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
