@@ -4,7 +4,7 @@ Contact: karakan@sc.edu
 This code models given single channel, or channel network
 with meshless RBFCM. The governing equation for the discharge
 is variable parameter advection-diffusion. The governing equation
-for water depths is dh/dx = S_0 - S_f.
+for water depths is dh/dx = S_0 - S_f. 
 
 --------------------pre process--------------------------
 Create a directory for the case (eg. syntheticNetwork)

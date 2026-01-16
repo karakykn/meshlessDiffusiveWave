@@ -6,7 +6,7 @@ from source import *
 caseName = '2008flood_stLouis'
 
 solver = Network(caseName)
-# solver.warmup(tol = 1e-2)
+# solver.warmup(tol = 1e-3)
 solver.solve()
 
 
