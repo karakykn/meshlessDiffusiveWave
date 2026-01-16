@@ -1,0 +1,32 @@
+CFL
+0.99
+
+RBFtype (0=TPS, 1=MQ, 2=IMQ, MQ recommended)
+1
+
+shape parameter coefficient (c = x r_av), x:
+5000
+
+simEndTime (seconds)
+31536000
+
+printStep
+200
+
+downstream bc (0: normal flow, 1: flow depth specified):
+1
+
+segment 0: mississippi, quincy to grafton
+segment 1: missouri, st charles to madison
+segment 2: illinois from valley city to grafton
+segment 3: mississippi from grafton to madison
+segment 4: mississippi from madison to chester
+
+in order to find nwm id of any of the points along this reach,
+run on terminal in Research/Diffusive Wave RBFCM/routelink/contents:
+python3.10 route_link_to_meshless_xs_with_usgs_links.py \
+  --routelink ../RouteLink_CONUS.nc \
+  --start_gage 07378000 --end_gage 07380120 \
+  --out_dir ./xsAmite
+
+logs:

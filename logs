@@ -1,0 +1,28 @@
+--------------- 5.14.25 -------------------
+- In order to match the simple case diffusion results to that of dynamic wave, the friction
+slopes are evalatued using wide rectangular channel assumption. The modifications correspond 
+to line 414 and 326.
+- The diffusive limit is changed from 1e3 to 1e4 and 1e6. 1e4 results show better attenuation
+and it gets closer to diffusive wave results. However 1e6 approximated results worse than
+1e4. My take on the matter was that it is better to not to limit diffusivity so that the
+model would behave closer to what happens real. Therefore, I suspect that errors due to time
+integration may play a role. Change dt for the same diffusivity limit and see.
+- I changed dt to a 5 times lower number and didn't observe any changes in simple case n40
+diflim 1e3. This result makes my initial guess on the matter a better approach. However,
+I should find why the results diverge as I increase the diffusivity limit from 1e4 to 1e6
+
+--------------- 5.13.25 -------------------
+- Normal depth for downstream boundary is added. Don't forget to change the downstream boundary
+accordingly before the run.
+
+--------------- 4.16.25 -------------------
+- After implementing the stability condition for regular finite difference scheme to meshless, the model converges
+with CFL=0.3, irrespective of diffusive limits on synthetic rectangular channel.
+- The model converges with CFL=0.25 on simpleCase.
+- Consider doing a stability analysis on meshless and bound dt accordingly. If apriori stability condition is found,
+it can be implemented in the solver. However, aposteriori stability condition would require the computation of
+the eigenvalues of system matrix at every time step. This would increase the runtime, but make sure solutions
+converge no matter what.
+- It is better to use stab. condition for finite difference scheme and limit CFL around 0.25 or lower. This will
+ensure convergence without any computational burden. However, there might be cases where the model do not converge.
+In such cases, lowering CFL further would do.

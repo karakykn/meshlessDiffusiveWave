@@ -1,0 +1,17 @@
+CFL:
+.99
+
+RBF type: (0 TPS, 1 MQ, 2 IMQ)
+1
+
+shape parameter coefficient MQ (c = beta * r_av), beta: (beta is beta of tps if tps is on)
+8
+
+simulation end time (seconds):
+86400
+
+print step:
+2
+
+downstream bc (0: normal flow, 1: flow depth specified):
+0
