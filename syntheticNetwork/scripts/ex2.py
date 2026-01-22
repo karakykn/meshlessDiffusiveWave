@@ -7,6 +7,9 @@ from scipy.integrate import simpson
 def rmse(exact, approx):
     return np.sqrt(np.sum((exact-approx) ** 2) / len(exact))
 
+def mpe(exact, approx):
+    return np.sum(np.abs((exact - approx) / exact)) / len(exact) * 100
+
 # --- Global Plot Settings ---
 plt.rcParams.update({
     "font.family": "Helvetica",
@@ -87,6 +90,13 @@ for idx, seg in enumerate(segments):
 
         # Save downstream HEC for MPE
         hec_us_all[idx] = (timeHec, us_Q)
+
+    print(f'---------- Channel {idx} ----------')
+
+    mass_in = simpson(us_Q, timeHec * 3600)
+    mass_out = simpson(ds_Q, timeHec * 3600)
+    mbe_p = (mass_in - mass_out) / mass_in * 100
+    print(f'Mass balance error (Hec): {mbe_p:.2f}%')
 
     # --- Meshless Model Results ---
     segmentPath = os.path.join(caseName, seg, 'run')
@@ -213,14 +223,14 @@ for idx in hec_us_all:
         hec_interp = np.interp(common_time_hr, hec_t, hec_q)
         model_interp = np.interp(common_time_hr, model_t, model_q)
 
-        mpe = np.mean(np.abs((model_interp - hec_interp) / hec_interp)) * 100
-        mpe_values.append(mpe)
+        mpe_ = np.mean(np.abs((model_interp - hec_interp) / hec_interp)) * 100
+        mpe_values.append(mpe_)
 
 composite_mpe = np.mean(mpe_values) if mpe_values else np.nan
 
 # print(f"Mass Balance Error (Meshless): {mass_balance_error:.3f}%")
 # print(f"Mean Percentage Error (MPE) at channel 3 upstream: {composite_mpe:.3f}%")
-plt.savefig('ex2.pdf')
+# plt.savefig('ex2.pdf')
 plt.show()
 
 for idx in range(3):
@@ -256,5 +266,28 @@ for idx in range(3):
     rmse_p = rmse(ds_interp, model_interp)
     rmse_cns = rmse(ds_interp, cns_interp)
 
+    mpe_p = mpe(ds_interp, model_interp)
+    mpe_cns = mpe(ds_interp, cns_interp)
+
     print(f'Root mean square error (Meshless): {rmse_p:.4f}cms')
     print(f'Root mean square error (CNS): {rmse_cns:.4f}cms')
+    print(f'MPE (Meshless): {mpe_p:.2f}%')
+    print(f'MPE (CNS): {mpe_cns:.2f}%')
+
+us_file = os.path.join(hecras_dir, f'us{3}.txt')
+us = pd.read_csv(us_file, sep=r'\s+', header=None)
+us_Q = pd.to_numeric(us.iloc[1:, 4], errors='coerce').to_numpy()
+us_interp = np.interp(common_time_hr, timeHec, us_Q)
+model_interp = np.interp(common_time_hr, time_all[2] / 3600, upstreamQs_all[2])
+cns_interp = np.interp(common_time_hr, begtime_x / 3600, nwmus_x)
+
+rmse_p = rmse(us_interp, model_interp)
+rmse_cns = rmse(us_interp, cns_interp)
+
+mpe_p = mpe(us_interp, model_interp)
+mpe_cns = mpe(us_interp, cns_interp)
+
+print(f'Root mean square error (Meshless): {rmse_p:.4f}cms')
+print(f'Root mean square error (CNS): {rmse_cns:.4f}cms')
+print(f'MPE (Meshless): {mpe_p:.2f}%')
+print(f'MPE (CNS): {mpe_cns:.2f}%')

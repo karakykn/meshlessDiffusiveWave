@@ -143,7 +143,7 @@ start_date = datetime(2008, 1, 1, 0, 0, 0)
 
 hecPath = f'../data/hydros/ex4_hecresults/'
 hec_grafton = pd.read_csv(f'{hecPath}grafton.txt', skiprows=12, sep=',')
-hec_stCharles = hec_grafton[hec_grafton.iloc[:,1] == 173029]
+hec_grafton = hec_grafton[hec_grafton.iloc[:,1] == 173029]
 hec_grafton['Date'] = pd.to_datetime(hec_grafton.iloc[:,2], format='mixed')
 hec_grafton['Q-cms'] = hec_grafton.iloc[:,3]
 
@@ -284,6 +284,17 @@ def mpe(exact, approx):
 compute_errors("Grafton", usgs_grafton, Meshless_grafton)
 compute_errors("St. Charles", usgs_stCharles, Meshless_stCharles)
 compute_errors("St. Louis", usgs_stLouis, Meshless_stLouis)
+
+hec_grafton['seconds'] = (hec_grafton['Date'] - hec_grafton['Date'].iloc[0]).dt.total_seconds()
+hec_stCharles['seconds'] = (hec_stCharles['Date'] - hec_stCharles['Date'].iloc[0]).dt.total_seconds()
+hec_stLouis['seconds'] = (hec_stLouis['Date'] - hec_stLouis['Date'].iloc[0]).dt.total_seconds()
+hec_grafton['discharge-cms'] = hec_grafton['Q-cms']
+hec_stCharles['discharge-cms'] = hec_stCharles['Q-cms']
+hec_stLouis['discharge-cms'] = hec_stLouis['Q-cms']
+
+compute_errors("Grafton", usgs_grafton, hec_grafton)
+compute_errors("St. Charles", usgs_stCharles, hec_stCharles)
+compute_errors("St. Louis", usgs_stLouis, hec_stLouis)
 
 # df = pd.read_csv(f'../segment1/geo/boundary_Q', header=None, sep=' ', names=['sec', 'Q-cms'])
 # df['Date'] = start_date + pd.to_timedelta(df['sec'], unit='s')

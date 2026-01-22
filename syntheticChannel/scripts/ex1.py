@@ -137,16 +137,19 @@ ds_interp = np.interp(common_time_hr, timeHec, ds_Q)
 model_interp = np.interp(common_time_hr, timeValues/3600, downstreamQ)
 cns_interp = np.interp(common_time_hr, nwm_x[:, 0]/3600, nwm_x[:, 1])
 
-mpe = np.mean(np.abs((model_interp - ds_interp) / ds_interp)) * 100
+mpe_p = np.mean(np.abs((model_interp - ds_interp) / ds_interp)) * 100
+mpe_c= np.mean(np.abs((cns_interp - ds_interp) / ds_interp)) * 100
 rmse_p = rmse(ds_interp, model_interp)
 rmse_cns = rmse(ds_interp, cns_interp)
 
 # --- Print errors ---
-print(f"Mass Balance Error (Dynamic): {mass_balance_error_d:.3f}%")
-print(f"Mass Balance Error (Meshless): {mass_balance_error:.3f}%")
-print(f"Mass Balance Error (CNS): {mass_balance_error_nwm:.3f}%")
-print(f"Root Mean Square Error (Meshless): {rmse_p:.4f}cms")
-print(f"Root Mean Square Error (CNS): {rmse_cns:.4f}cms")
+print(f"Mass Balance Error (Dynamic): {mass_balance_error_d:.2f}%")
+print(f"Mass Balance Error (Meshless): {mass_balance_error:.2f}%")
+print(f"Mass Balance Error (CNS): {mass_balance_error_nwm:.2f}%")
+print(f"Root Mean Square Error (Meshless): {rmse_p:.2f}cms")
+print(f"Root Mean Square Error (CNS): {rmse_cns:.2f}cms")
+print(f"MPE (Meshless): {mpe_p:.2f}%")
+print(f"MPE (CNS): {mpe_c:.2f}%")
 
 
 plt.xlim([0, 24])
@@ -155,4 +158,59 @@ plt.xlabel('Time (hr)', fontsize=12, fontname='Helvetica')
 plt.ylabel(r'Discharge $(cms)$', fontsize=12, fontname='Helvetica')
 plt.legend()
 plt.savefig('ex1.pdf')
-plt.show()
+# plt.show()
+
+# def compute_errors(site_name, obs_df, Meshless_df, cnx_df=None):
+#     # drop NaN discharge values
+#     lT = cnx_df['t'].iloc[-1]
+#     obs_df = obs_df[obs_df['seconds'] <= lT]
+#     obs_df = obs_df.dropna(subset=['Q-cms']).reset_index(drop=True)
+#     Meshless_df = Meshless_df[Meshless_df['seconds'] <= lT]
+#     Meshless_df = Meshless_df.dropna(subset=['discharge-cms']).reset_index(drop=True)
+#     if cnx_df is not None and 'Q' in cnx_df.columns:
+#         cnx_df = cnx_df.dropna(subset=['Q']).reset_index(drop=True)
+#
+#     # mass out from observed
+#     mass_out_obs = simpson(obs_df['Q-cms'], obs_df['seconds'])
+#     netflux_perc = ((mass_in - mass_out_obs) / mass_in) * 100
+#
+#     # Meshless mass out
+#     mass_out_Meshless = simpson(Meshless_df['discharge-cms'], Meshless_df['seconds'])
+#     mass_balance_error_Meshless = ((mass_in - mass_out_Meshless) / mass_in) * 100
+#
+#     # CNX mass out (if available)
+#     mass_balance_error_cnx = None
+#     if cnx_df is not None and 'Q' in cnx_df.columns and 't' in cnx_df.columns:
+#         mass_out_cnx = simpson(cnx_df['Q'], cnx_df['t'])
+#         mass_balance_error_cnx = ((mass_in - mass_out_cnx) / mass_in) * 100
+#
+#     # Mean Percentage Error (interpolate Meshless and CNX onto observation time grid)
+#     Meshless_interp = np.interp(obs_df['seconds'], Meshless_df['seconds'], Meshless_df['discharge-cms'])
+#     mpe_Meshless = mpe(obs_df['Q-cms'], Meshless_interp)
+#     rmse_Meshless = rmse(obs_df['Q-cms'], Meshless_interp)
+#
+#     # mpe_cnx = None
+#     # if cnx_df is not None and 'Q' in cnx_df.columns and 't' in cnx_df.columns:
+#     #     cnx_interp = np.interp(obs_df['seconds'], cnx_df['t'], cnx_df['Q'])
+#     #     mpe_cnx = np.mean(np.abs((obs_df['Q-cms'] - cnx_interp) / obs_df['Q-cms'])) * 100
+#
+#     cnx_interp = np.interp(obs_df['seconds'], cnx_df['t'], cnx_df['Q'])
+#     mpe_cnx = mpe(obs_df['Q-cms'], cnx_interp)
+#     rmse_cnx = rmse(obs_df['Q-cms'], cnx_interp)
+#
+#     print(f"---{site_name}---")
+#     print(f"Mean Percentage Error (Meshless): {mpe_Meshless:.2f}%")
+#     print(f"Mean Percentage Error (CNS): {mpe_cnx:.2f}%")
+#     print(f"Root Mean Square Error (Meshless): {rmse_Meshless:.2f} cms")
+#     print(f"Root Mean Square Error (CNS): {rmse_cnx:.2f} cms")
+#     print("")
+#
+# def rmse(exact, approx):
+#     return np.sqrt(np.sum((exact-approx) ** 2) / len(exact))
+#
+# def mpe(exact, approx):
+#     return np.sum(np.abs((exact - approx) / exact)) / len(exact) * 100
+#
+# # compute errors for Baton and Belle
+# compute_errors("Baton Rouge", observation_baton, Meshless_baton, CNX_baton)
+# compute_errors("Belle Chasse", observation_belle, Meshless_belle, CNX_belle)

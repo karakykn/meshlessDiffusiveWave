@@ -195,11 +195,14 @@ class Network(object):
             for j in range(self.num_segments):
                 self.segments[j].h = np.zeros_like(self.segments[j].Q)
                 for i in range(self.segments[j].nodeNo):
-                    self.segments[j].h[i] = np.interp(self.segments[j].Q[i], self.segments[j].bar_params[i][1, :], self.segments[j].bar_params[i][0, :])
+                    self.segments[j].h[i] = np.interp(self.segments[j].Q[i], self.segments[j].bar_params[i][1, :],
+                                                      self.segments[j].bar_params[i][0, :])
                 self.segments[j].h_old[:] = self.segments[j].h[:]
 
             while True:
                 dt = 1e8
+                jbc = np.zeros(self.num_segments)
+                ddqddx = np.zeros(self.num_segments)
                 for i in range(self.num_segments):
                     # self.segments[i].readLateral(0)
                     self.segments[i].Q[0] = self.segments[i].read_upstream_Q(0)
@@ -210,13 +213,23 @@ class Network(object):
                     dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
                     dt = min(dt, np.nanmin(np.abs(dt_arr[:, 0])))
 
-                dt = self.CFL * dt
+                    ddqddx[i] = np.matmul(self.segments[i].fxx_invF, self.segments[i].Q)[-1]
 
+                dt = self.CFL * dt * .1
+
+                for i in range(self.num_segments):
+                    for j in self.segDownstreamInfo[i]:
+                        # jbc[i] += self.segments[j].cele[0] * self.segments[j].Q[0] - self.segments[j].diffu[0] * self.segments[j].dQdx[0]
+                        for k in self.segUpstreamInfo[j]:
+                            if i != k:
+                                jbc[i] = self.segments[k].cele[-1] * self.segments[k].dQdx[-1] - self.segments[k].diffu[-1] * \
+                                      ddqddx[k]
+                                # jbc[i] = self.segments[k].dQdx[-1]
                 iter += 1
 
                 for i in self.calcOrder:
                     # self.segments[i].readLateral(0)
-                    self.segments[i].solveSeg_CN_warmup(dt, self.segDownstreamInfo[i])
+                    self.segments[i].solveSeg_CN2(dt, self.segDownstreamInfo[i], jbc[i])
                     for j in self.segDownstreamInfo[i]:
                         self.set_junctionbc_null(j)
 
@@ -225,31 +238,32 @@ class Network(object):
                     for j in self.segDownstreamInfo[i]:
                         self.update_junction_Q(self.segments[i].Q[-1], j)
 
-
                 for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
+                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
                         '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
+                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],
+                                                           self.segments[i].bar_params[-1][1, :],
+                                                           self.segments[i].bar_params[-1][0, :])
                     else:
                         self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     self.segments[i].solveSeg_h5()
                     for j in self.segUpstreamInfo[i]:
                         self.update_junction_h_warmup(self.segments[i].h[0], j)
 
-
                 for i in range(self.num_segments):
-                    res[i] = np.max(np.abs((self.segments[i].h_old[:] - self.segments[i].h[:]) / self.segments[i].h[:]) * 100)
+                    res[i] = np.max(
+                        np.abs((self.segments[i].h_old[:] - self.segments[i].h[:]) / self.segments[i].h[:]) * 100)
                     self.segments[i].oldQ[:] = self.segments[i].Q[:]
                     self.segments[i].h_old[:] = self.segments[i].h[:]
 
                 print(f'Residual (%): {np.max(res):.5f}, Iteration: {iter}')
-                if np.max(res) < tol or iter>999:
+                if (np.max(res) < tol and iter > 10) or iter > 999:
                     for i in range(self.num_segments):
                         np.savetxt(f"{self.caseName}/segment{i}/run/0/h", self.segments[i].h[:])
                         # np.savetxt(f"{self.caseName}/segment{i}/run/0/Q", self.segments[i].Q[:])
-                        np.savetxt(f'{self.caseName}/segment{i}/geo/boundary_h', np.array([[0, self.segments[i].h[-1]]]))
+                        dummy = np.atleast_2d(np.loadtxt(f'{self.caseName}/segment{i}/geo/boundary_h'))
+                        dummy[0, :] = np.array([[0, self.segments[i].h[-1]]])
+                        np.savetxt(f'{self.caseName}/segment{i}/geo/boundary_h', dummy)
                         Qini = np.loadtxt(f"{self.caseName}/segment{i}/run/0/Q")
                         rmse = np.sqrt(np.sum((self.segments[i].Q - Qini) ** 2 / len(Qini)))
                         print(f'Simulation warmed up in {iter} iterations. Deviation in Q of channel {i}: {rmse:.6f}')
@@ -365,15 +379,16 @@ class Network(object):
     def solve2(self):
         iter = 0
         if self.time_integrator == 0:
-            omega = .075
+            omega = .07
             dt_old = 0
-            while self.time < self.simEndTime:
 
-                if self.time > 62747:
+            while self.time < self.simEndTime:
+                dt = 1e8
+
+                if iter > 0:
                     pass
 
-                dt = 1e8
-                new_xi = np.zeros(self.num_segments)
+                jbc = np.zeros(self.num_segments)
                 for i in range(self.num_segments):
                     # self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
                     self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
@@ -388,7 +403,14 @@ class Network(object):
                     # cf = np.max(np.abs(self.segments[i].lat / self.segments[i].latLimiter))
                     # dt /= max(1, cf)
 
-                    # new_xi[i] = self.segments[i].dQdx[-1]
+                for i in range(self.num_segments):
+                    for j in self.segDownstreamInfo[i]:
+                        # jbc[i] += self.segments[j].cele[0] * self.segments[j].Q[0] - self.segments[j].diffu[0] * self.segments[j].dQdx[0]
+                        for k in self.segUpstreamInfo[j]:
+                            if i != k:
+                                # jbc[i] -= self.segments[k].cele[-1] * self.segments[k].Q[-1] - self.segments[k].diffu[-1] * \
+                                #       self.segments[k].dQdx[-1]
+                                jbc[i] = -self.segments[k].dQdx[-1]
 
                 dt = self.CFL * dt
                 iter += 1
@@ -397,7 +419,7 @@ class Network(object):
                 for i in self.calcOrder:
                     self.segments[i].readLateral(self.time, dt)
                     self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-                    self.segments[i].solveSeg_CN(dt, self.segDownstreamInfo[i])
+                    self.segments[i].solveSeg_CN2(dt, self.segDownstreamInfo[i], jbc[i])
                     # for j in self.segDownstreamInfo[i]:
                     #     self.set_junctionbc_null(j)
 
@@ -407,50 +429,14 @@ class Network(object):
                         self.update_junction_Q(self.segments[i].Q[-1], j)
 
                 for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
+                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
                         '''rating curve for the most downstream boundary'''
                         self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],self.segments[i].bar_params[-1][1, :], self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     else:
                         self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
                     self.segments[i].solveSeg_h5()
                     for j in self.segUpstreamInfo[i]:
                         self.update_junction_h(self.segments[i].h[0], j)
-
-                correction_counter = 0
-                res = np.ones(self.num_segments)
-
-                while correction_counter < 0:
-                    correction_counter += 1
-                    for i in self.calcOrder:
-                        for j in self.segDownstreamInfo[i]:
-                            self.set_junctionbc_null(j)
-                        dtA = (self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-                        new_xi[i] = omega * -dtA + (1 - omega) * self.segments[i].dQdx[-1]
-
-                        # self.update_celerity(i, -dtA)
-                    for i in self.calcOrder:
-                        # self.segments[i].readLateral(self.time)
-                        self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                        self.segments[i].solveSeg_CN_sec(dt, self.segDownstreamInfo[i], new_xi[i])
-
-                        """non-iterative, distinct solution for each segment"""
-                        for j in self.segDownstreamInfo[i]:
-                            self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                    for i in self.calcOrder[::-1]:
-                        if i == self.calcOrder[-1]:
-                            '''rating curve for the most downstream boundary'''
-                            self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                            '''fixed flow depth for the most dwnstream boundary'''
-                            # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        else:
-                            self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        self.segments[i].solveSeg_h5()
-                        for j in self.segUpstreamInfo[i]:
-                            self.update_junction_h(self.segments[i].h[0], j)
 
                 for i in range(self.num_segments):
                     # self.segments[i].area_old2 = self.segments[i].area_old[-1]
@@ -463,12 +449,14 @@ class Network(object):
                     print(f'------------- Max Q ----- Min Q ------- Max h --- Min h --- Max dQ/dx --------- Min dQ/dx')
                     for i in self.calcOrder:
                         print(f'Channel {i+1}:    {max(self.segments[i].Q):.2f}      {min(self.segments[i].Q):.2f}      {max(self.segments[i].h):.2f}    '
-                              f'  {min(self.segments[i].h):.2f}      {max(self.segments[i].dQdx):.6f}      {min(self.segments[i].dQdx):.6f}')
+                              f'  {min(self.segments[i].h):.2f}      {max(self.segments[i].dQdx):.6f}      {min(self.segments[i].dQdx):.6f}      {max(self.segments[i].cele):.6f}')
                         # print(self.segments[i].diffu)
                         time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
                         os.makedirs(time_folder, exist_ok=True)
                         np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
                         np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+
+                    self.clear_boundaryDocs(self.printStep)
                     print(f'----------------------------------------------\n')
             time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
             os.makedirs(time_folder, exist_ok=True)
@@ -1839,8 +1827,6 @@ class SingleChannel(object):
         self.invSys = np.linalg.pinv(self.sys)
         self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
 
-        # self.apply_lateral_split(dt)
-
     def solveSeg_CN_sec(self, dt, dInfo, new_xi, theta = .85):
         self.rhs[0] = self.Q[0]
         for i in dInfo:
@@ -1894,14 +1880,18 @@ class SingleChannel(object):
         self.invSys = np.linalg.pinv(self.sys)
         self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
 
-    def solveSeg_CN2(self, dt, dInfo, theta=.85):
+    def solveSeg_CN2(self, dt, dInfo, jbc, theta=.85):
         adv = np.matmul(np.diag(self.cele), np.matmul(self.fx_invF, self.oldQ)) # switch with self.dqdx for speed
         diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.oldQ))
         self.lat = self.cele * self.lat
 
         self.rhs[0] = self.Q[0]
         self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + dt * self.lat[1:-1]
+        # self.rhs[-1] = self.dQdx[-1]
         self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
+        # coef = self.oldQ[-1] * 2 / self.area_old[-1]
+        # self.rhs[-1] = self.oldQ[-1] - dt * (1 - theta) * coef * self.dQdx[-1]
+        # self.latLimiter = np.abs((1 - theta) * ((-adv + diff)))
 
         carpim_adv = np.matmul(np.diag(self.cele), self.fx[:,:self.nodeNo])
         carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:,:self.nodeNo])
@@ -1914,6 +1904,8 @@ class SingleChannel(object):
                                                         - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
                                                         + self.geo['nodes'][1:self.nodeNo - 1] ** 2
 
+        # self.sys[self.nodeNo-1, :] = self.fx[self.nodeNo-1, :]
+
         self.sys[self.nodeNo-1, :self.nodeNo] = self.f[self.nodeNo-1, :self.nodeNo] + dt * theta * (carpim_adv[-1, :])
         self.sys[self.nodeNo - 1, self.nodeNo] = 1
         self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][-1] + dt * theta * self.cele[-1]
@@ -1924,16 +1916,15 @@ class SingleChannel(object):
         self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
         self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
 
-        # for i in dInfo:
-        #     self.rhs[self.nodeNo-1] = self.cele[0] * self.Q[0] - self.diffu[0] * self.dQdx[0]
-        #     self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1,:]
-        # self.rhs[-1] = new_xi
-        # self.sys[-1, :] = self.fx[-1, :]
+        for i in dInfo:
+            # self.rhs[self.nodeNo-1] = 0
+            self.rhs[self.nodeNo-1] = jbc
+            # self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1, :]
+            self.sys[self.nodeNo - 1, :] = self.cele[-1] * self.fx[-1, :] - self.diffu[-1] * self.fxx[-1, :]
+
 
         self.invSys = np.linalg.pinv(self.sys)
         self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-        # self.apply_lateral_split(dt)
 
     def solveSeg_CN_sec2(self, dt, dInfo, convdiff_flux, theta = .85):
         self.rhs[0] = self.Q[0]

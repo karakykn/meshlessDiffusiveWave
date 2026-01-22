@@ -11,7 +11,7 @@ simulation end time (seconds):
 86400
 
 print step:
-2
+1
 
 downstream bc (0: normal flow, 1: flow depth specified):
 0
