@@ -213,18 +213,18 @@ class Network(object):
                     dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
                     dt = min(dt, np.nanmin(np.abs(dt_arr[:, 0])))
 
-                    ddqddx[i] = np.matmul(self.segments[i].fxx_invF, self.segments[i].Q)[-1]
+
+                    # ddqddx[i] = np.matmul(self.segments[i].fxx_invF, self.segments[i].Q)[-1]
 
                 dt = self.CFL * dt * .1
 
                 for i in range(self.num_segments):
                     for j in self.segDownstreamInfo[i]:
-                        # jbc[i] += self.segments[j].cele[0] * self.segments[j].Q[0] - self.segments[j].diffu[0] * self.segments[j].dQdx[0]
-                        for k in self.segUpstreamInfo[j]:
-                            if i != k:
-                                jbc[i] = self.segments[k].cele[-1] * self.segments[k].dQdx[-1] - self.segments[k].diffu[-1] * \
-                                      ddqddx[k]
-                                # jbc[i] = self.segments[k].dQdx[-1]
+                        jbc[i] = self.segments[i].dQdx[-1] + (self.segments[j].cele[0] * dt) / (
+                                self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                                - self.segments[i].cele[-2] * dt
+                                + self.segments[j].cele[0] * dt) \
+                                 * (self.segments[i].dQdx[-2] - self.segments[j].dQdx[0])
                 iter += 1
 
                 for i in self.calcOrder:
@@ -297,6 +297,27 @@ class Network(object):
                 iter += 1
                 self.time += dt
 
+                jbc = np.zeros(self.num_segments)
+                for i in range(self.num_segments):
+                    for j in self.segDownstreamInfo[i]:
+                        # jbc[i] = self.segments[i].dQdx[-1] + (self.segments[j].cele[0] * dt) / (
+                        #         self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                        #         - self.segments[i].cele[-2] * dt
+                        #         + self.segments[j].cele[0] * dt) \
+                        #          * (self.segments[i].dQdx[-2] - self.segments[j].dQdx[0])
+                        for k in self.segUpstreamInfo[j]:
+                            if i != k:
+                                cele_f = self.segments[i].cele[-1]
+                                dqdx_f = self.segments[j].dQdx[0] - self.segments[k].dQdx[-1]
+                                jbc[i] = self.segments[i].dQdx[-1] + (cele_f * dt) / (
+                                        self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                                        - self.segments[i].cele[-2] * dt
+                                        + cele_f * dt) \
+                                         * (self.segments[i].dQdx[-2] - dqdx_f)
+                                jbc[i] = self.segments[j].cele[0] * self.segments[j].dQdx[0] \
+                                        -self.segments[i].cele[-1] * self.segments[i].dQdx[-1] \
+                                         - self.segments[k].cele[-1] * self.segments[k].dQdx[-1]
+
                 for i in self.calcOrder:
                     self.segments[i].readLateral(self.time, dt)
                     self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
@@ -368,6 +389,12 @@ class Network(object):
                         os.makedirs(time_folder, exist_ok=True)
                         np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
                         np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+                        # plt.plot(iter, self.segments[0].dQdx[-1], marker='x', color='k', markersize=3)
+                        plt.plot(iter, self.segments[1].dQdx[-1], marker='x', color='b', markersize=3)
+                        plt.plot(iter, self.segments[2].dQdx[0], marker='x', color='r', markersize=3)
+                        # plt.plot(iter, jbc[0], marker='+', color='k', markersize=3)
+                        plt.plot(iter, jbc[1], marker='+', color='b', markersize=3)
+                        # plt.plot(iter, jbc[2], marker='+', color='r', markersize=3)
 
                     self.clear_boundaryDocs(self.printStep)
                     print(f'----------------------------------------------\n')
@@ -375,6 +402,7 @@ class Network(object):
             os.makedirs(time_folder, exist_ok=True)
             np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
             np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+            # plt.show()
 
     def solve2(self):
         iter = 0
@@ -405,12 +433,18 @@ class Network(object):
 
                 for i in range(self.num_segments):
                     for j in self.segDownstreamInfo[i]:
-                        # jbc[i] += self.segments[j].cele[0] * self.segments[j].Q[0] - self.segments[j].diffu[0] * self.segments[j].dQdx[0]
-                        for k in self.segUpstreamInfo[j]:
-                            if i != k:
-                                # jbc[i] -= self.segments[k].cele[-1] * self.segments[k].Q[-1] - self.segments[k].diffu[-1] * \
-                                #       self.segments[k].dQdx[-1]
-                                jbc[i] = -self.segments[k].dQdx[-1]
+                        jbc[i] = self.segments[i].dQdx[-1] + (self.segments[j].cele[0] * dt) / (
+                                self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                                - self.segments[i].cele[-2] * dt
+                                + self.segments[j].cele[0] * dt) \
+                                 * (self.segments[i].dQdx[-2] - self.segments[j].dQdx[0])
+                        # for k in self.segUpstreamInfo[j]:
+                        #     if i != k:
+                                # jbc[i] = self.segments[i].dQdx[-1] + (self.segments[i].cele[-1] * dt) / (
+                                #             self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                                #             - self.segments[i].cele[-2] * dt
+                                #             + self.segments[i].cele[-1] * dt) \
+                                #          * (self.segments[i].dQdx[-2] - self.segments[i].dQdx[-1])
 
                 dt = self.CFL * dt
                 iter += 1
@@ -455,6 +489,10 @@ class Network(object):
                         os.makedirs(time_folder, exist_ok=True)
                         np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
                         np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+                        plt.plot(iter, self.segments[0].dQdx[-1], marker='o', color='k')
+                        plt.plot(iter, self.segments[1].dQdx[-1], marker='o', color='b')
+                        plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
+                        plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
 
                     self.clear_boundaryDocs(self.printStep)
                     print(f'----------------------------------------------\n')
@@ -462,6 +500,7 @@ class Network(object):
             os.makedirs(time_folder, exist_ok=True)
             np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
             np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+            plt.show()
 
     def solve_ydk(self):
         iter = 0
@@ -1920,8 +1959,8 @@ class SingleChannel(object):
             # self.rhs[self.nodeNo-1] = 0
             self.rhs[self.nodeNo-1] = jbc
             # self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1, :]
-            self.sys[self.nodeNo - 1, :] = self.cele[-1] * self.fx[-1, :] - self.diffu[-1] * self.fxx[-1, :]
-
+            # self.sys[self.nodeNo - 1, :] = self.cele[-1] * self.fx[-1, :] - self.diffu[-1] * self.fxx[-1, :]
+            self.sys[self.nodeNo - 1, :] = self.fx[-1, :]
 
         self.invSys = np.linalg.pinv(self.sys)
         self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
@@ -1972,7 +2011,7 @@ class SingleChannel(object):
         self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
 
         for i in dInfo:
-            self.rhs[self.nodeNo-1] = self.cele[-1] * self.Q[-1] - self.diffu[-1] * self.dQdx[-1]
+            self.rhs[self.nodeNo-1] = jbc
             self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1,:]
 
         self.invSys = np.linalg.pinv(self.sys)
