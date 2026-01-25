@@ -219,17 +219,15 @@ class Network(object):
                 dt = self.CFL * dt * .1
 
                 for i in range(self.num_segments):
-                    for j in self.segDownstreamInfo[i]:
-                        jbc[i] = self.segments[i].dQdx[-1] + (self.segments[j].cele[0] * dt) / (
-                                self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                                - self.segments[i].cele[-2] * dt
-                                + self.segments[j].cele[0] * dt) \
-                                 * (self.segments[i].dQdx[-2] - self.segments[j].dQdx[0])
+                    dx = self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                    coef = dx - self.segments[i].cele[-2] * dt
+                    jbc[i] = self.segments[i].Q[-2] + coef / (coef + dx - self.segments[i].cele[-2] * dt) * \
+                             (self.segments[i].Q[-1] - self.segments[i].Q[-2])
                 iter += 1
 
                 for i in self.calcOrder:
                     # self.segments[i].readLateral(0)
-                    self.segments[i].solveSeg_CN2(dt, self.segDownstreamInfo[i], jbc[i])
+                    self.segments[i].solveSeg_CN(dt, self.segDownstreamInfo[i])
                     for j in self.segDownstreamInfo[i]:
                         self.set_junctionbc_null(j)
 
@@ -246,7 +244,7 @@ class Network(object):
                                                            self.segments[i].bar_params[-1][0, :])
                     else:
                         self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5()
+                    self.segments[i].solveSeg_h6(dt)
                     for j in self.segUpstreamInfo[i]:
                         self.update_junction_h_warmup(self.segments[i].h[0], j)
 
@@ -309,14 +307,18 @@ class Network(object):
                             if i != k:
                                 cele_f = self.segments[i].cele[-1]
                                 dqdx_f = self.segments[j].dQdx[0] - self.segments[k].dQdx[-1]
-                                jbc[i] = self.segments[i].dQdx[-1] + (cele_f * dt) / (
-                                        self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                                        - self.segments[i].cele[-2] * dt
-                                        + cele_f * dt) \
-                                         * (self.segments[i].dQdx[-2] - dqdx_f)
-                                jbc[i] = self.segments[j].cele[0] * self.segments[j].dQdx[0] \
-                                        -self.segments[i].cele[-1] * self.segments[i].dQdx[-1] \
-                                         - self.segments[k].cele[-1] * self.segments[k].dQdx[-1]
+                                # jbc[i] = self.segments[i].dQdx[-1] + (cele_f * dt) / (
+                                #         self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                                #         - self.segments[i].cele[-2] * dt
+                                #         + cele_f * dt) \
+                                #          * (self.segments[i].dQdx[-2] - dqdx_f)
+                                # jbc[i] = self.segments[j].cele[0] * self.segments[j].dQdx[0] \
+                                #         -self.segments[i].cele[-1] * self.segments[i].dQdx[-1] \
+                                #          - self.segments[k].cele[-1] * self.segments[k].dQdx[-1]
+                                dx = self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                                coef = dx - self.segments[i].cele[-2] * dt
+                                jbc[i] = self.segments[i].Q[-2] + coef / (coef + dx - self.segments[i].cele[-2] * dt) * \
+                                                                    (self.segments[i].Q[-1] - self.segments[i].Q[-2])
 
                 for i in self.calcOrder:
                     self.segments[i].readLateral(self.time, dt)
@@ -390,10 +392,10 @@ class Network(object):
                         np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
                         np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
                         # plt.plot(iter, self.segments[0].dQdx[-1], marker='x', color='k', markersize=3)
-                        plt.plot(iter, self.segments[1].dQdx[-1], marker='x', color='b', markersize=3)
-                        plt.plot(iter, self.segments[2].dQdx[0], marker='x', color='r', markersize=3)
-                        # plt.plot(iter, jbc[0], marker='+', color='k', markersize=3)
-                        plt.plot(iter, jbc[1], marker='+', color='b', markersize=3)
+                        # plt.plot(iter, self.segments[1].dQdx[-1], marker='x', color='b', markersize=3)
+                        # plt.plot(iter, self.segments[2].dQdx[0], marker='x', color='r', markersize=3)
+                        # plt.plot(iter, jbc[1], marker='+', color='k', markersize=3)
+                        # plt.plot(iter, self.segments[1].Q[-1], marker='+', color='b', markersize=3)
                         # plt.plot(iter, jbc[2], marker='+', color='r', markersize=3)
 
                     self.clear_boundaryDocs(self.printStep)
@@ -432,19 +434,10 @@ class Network(object):
                     # dt /= max(1, cf)
 
                 for i in range(self.num_segments):
-                    for j in self.segDownstreamInfo[i]:
-                        jbc[i] = self.segments[i].dQdx[-1] + (self.segments[j].cele[0] * dt) / (
-                                self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                                - self.segments[i].cele[-2] * dt
-                                + self.segments[j].cele[0] * dt) \
-                                 * (self.segments[i].dQdx[-2] - self.segments[j].dQdx[0])
-                        # for k in self.segUpstreamInfo[j]:
-                        #     if i != k:
-                                # jbc[i] = self.segments[i].dQdx[-1] + (self.segments[i].cele[-1] * dt) / (
-                                #             self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                                #             - self.segments[i].cele[-2] * dt
-                                #             + self.segments[i].cele[-1] * dt) \
-                                #          * (self.segments[i].dQdx[-2] - self.segments[i].dQdx[-1])
+                    dx = self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
+                    coef = dx - self.segments[i].cele[-2] * dt
+                    jbc[i] = self.segments[i].Q[-2] + coef / (coef + dx - self.segments[i].cele[-2] * dt) * \
+                             (self.segments[i].Q[-1] - self.segments[i].Q[-2])
 
                 dt = self.CFL * dt
                 iter += 1
@@ -453,7 +446,7 @@ class Network(object):
                 for i in self.calcOrder:
                     self.segments[i].readLateral(self.time, dt)
                     self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-                    self.segments[i].solveSeg_CN2(dt, self.segDownstreamInfo[i], jbc[i])
+                    self.segments[i].solveSeg_CN(dt, self.segDownstreamInfo[i])
                     # for j in self.segDownstreamInfo[i]:
                     #     self.set_junctionbc_null(j)
 
@@ -468,7 +461,7 @@ class Network(object):
                         self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],self.segments[i].bar_params[-1][1, :], self.segments[i].bar_params[-1][0, :])
                     else:
                         self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5()
+                    self.segments[i].solveSeg_h6(dt)
                     for j in self.segUpstreamInfo[i]:
                         self.update_junction_h(self.segments[i].h[0], j)
 
@@ -489,10 +482,10 @@ class Network(object):
                         os.makedirs(time_folder, exist_ok=True)
                         np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
                         np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-                        plt.plot(iter, self.segments[0].dQdx[-1], marker='o', color='k')
-                        plt.plot(iter, self.segments[1].dQdx[-1], marker='o', color='b')
-                        plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
-                        plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
+                        # plt.plot(iter, self.segments[0].dQdx[-1], marker='o', color='k')
+                        # plt.plot(iter, self.segments[1].dQdx[-1], marker='o', color='b')
+                        # plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
+                        # plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
 
                     self.clear_boundaryDocs(self.printStep)
                     print(f'----------------------------------------------\n')
@@ -500,7 +493,7 @@ class Network(object):
             os.makedirs(time_folder, exist_ok=True)
             np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
             np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            plt.show()
+            # plt.show()
 
     def solve_ydk(self):
         iter = 0
@@ -1267,6 +1260,7 @@ class SingleChannel(object):
         self.topW = np.zeros_like(self.Q)
         self.topW_old = np.zeros_like(self.Q)
         self.cele = np.zeros_like(self.Q)
+        self.cele_h = np.zeros_like(self.Q)
         self.diffu = np.zeros_like(self.Q)
         self.dhdx = np.zeros_like(self.Q)
         self.COR = np.zeros_like(self.Q)
@@ -1636,6 +1630,7 @@ class SingleChannel(object):
             # print(self.COR)
             # self.COR[i] = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
 
+            self.cele_h[i] = celebar * self.COR[i]
             self.cele[i] = celebar / 2 * (self.COR[i] * (1 + Qbar / difbar * dd_dq) + 1 / self.COR[i] * (1 - Qbar / difbar * dd_dq))
             self.diffu[i] = difbar / self.COR[i]
         Qbar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][1, :])
@@ -1652,6 +1647,7 @@ class SingleChannel(object):
             self.COR[-1] = np.sqrt(np.maximum(1e-8, arg))
             # self.COR[-1] = np.sqrt(1 - 2 * difbar / celebar / self.Q[-1] * self.dQdx[-1])
 
+        self.cele_h[-1] = celebar * self.COR[-1]
         self.cele[-1] = celebar / 2 * (self.COR[-1] * (1 + Qbar / difbar * dd_dq) + 1 / self.COR[-1] * (1 - Qbar / difbar * dd_dq))
         self.diffu[-1] = difbar / self.COR[-1]
 
@@ -1956,11 +1952,18 @@ class SingleChannel(object):
         self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
 
         for i in dInfo:
-            # self.rhs[self.nodeNo-1] = 0
-            self.rhs[self.nodeNo-1] = jbc
-            # self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1, :]
-            # self.sys[self.nodeNo - 1, :] = self.cele[-1] * self.fx[-1, :] - self.diffu[-1] * self.fxx[-1, :]
-            self.sys[self.nodeNo - 1, :] = self.fx[-1, :]
+            self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv + diff)[-1])
+            self.sys[self.nodeNo - 1, :self.nodeNo] = self.f[-1, :self.nodeNo] + dt * theta * (
+                        carpim_adv[-1, :] - carpim_diffu[-1, :])
+            self.sys[self.nodeNo - 1, self.nodeNo] = 1
+            self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][
+                                                           self.nodeNo - 1] + dt * theta * self.cele[
+                                                                                             self.nodeNo - 1]
+            self.sys[self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][
+                                                               self.nodeNo - 1] * dt * theta * self.cele[
+                                                                                                 self.nodeNo - 1] \
+                                                           - 2 * theta * dt * self.diffu[self.nodeNo - 1] \
+                                                           + self.geo['nodes'][self.nodeNo - 1] ** 2
 
         self.invSys = np.linalg.pinv(self.sys)
         self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
@@ -2152,6 +2155,49 @@ class SingleChannel(object):
         # self.dhdx = np.matmul(self.fx_invF, self.h)
         # self.d2hdx2 = np.matmul(self.fxx_invF, self.h)
 
+    def solveSeg_h6(self, dt, theta = 0.85):
+        '''Calculate new h'''
+        adv = np.matmul(np.diag(self.cele_h), np.matmul(self.fx_invF, self.h_old))  # switch with self.dqdx for speed
+        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.h_old))
+        self.lat = self.cele_h * self.lat
+
+        self.rhs[0] = self.geo['slopes'][0] * (1 - self.COR[0] ** 2)
+        # self.rhs[0] = self.h_old[0] + (1 - theta) * dt * ((-adv + diff)[0])
+        # self.rhs[1:self.nodeNo - 1] = self.h_old[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) # + dt * self.lat[1:-1]
+        # self.rhs[self.nodeNo - 1] = self.h[-1]
+
+        carpim_adv = np.matmul(np.diag(self.cele_h), self.fx[:, :self.nodeNo])
+        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:, :self.nodeNo])
+
+        self.sys[0, :] = self.fx[0, :]
+        # self.sys[0, :] = self.f[0, :]
+        # self.sys[0, :self.nodeNo] = self.f[0, :self.nodeNo] + dt * theta * (
+        #             carpim_adv[0, :])
+        # self.sys[0, self.nodeNo] = 1
+        # self.sys[0, self.nodeNo + 1] = self.geo['nodes'][0] + dt * theta * self.cele_h[0]
+        # self.sys[0, self.nodeNo + 2] = 2 * self.geo['nodes'][0] * dt * theta * self.cele_h[0] \
+        #                                                 + self.geo['nodes'][0] ** 2
+
+        self.sys[1:self.nodeNo - 1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (
+                    carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
+        self.sys[1:self.nodeNo - 1, self.nodeNo] = 1
+        self.sys[1:self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][1:self.nodeNo - 1] + dt * theta * self.cele_h[
+                                                                                                           1:self.nodeNo - 1]
+        self.sys[1:self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][
+                                                           1:self.nodeNo - 1] * dt * theta * self.cele_h[
+                                                                                             1:self.nodeNo - 1] \
+                                                       - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
+                                                       + self.geo['nodes'][1:self.nodeNo - 1] ** 2
+
+        self.sys[self.nodeNo - 1, :] = self.f[-1, :]
+
+        self.sys[self.nodeNo, :self.nodeNo] = 1
+        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
+        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
+
+        self.invSysH = np.linalg.pinv(self.sys)
+        self.h = np.matmul(self.f, np.matmul(self.invSysH, self.rhs))
+
     def interp_wet_area(self, i):
         h = self.h[i]
         xsNo = self.geo['xsInfo'][i]
@@ -2166,12 +2212,13 @@ class SingleChannel(object):
     def xs_param_save(self):
         unique_xs = sorted(set(self.geo['xsInfo']))
         self.xsParams = [None] * len(unique_xs)
+        NN = 300
 
         for xs_id in unique_xs:
             xs = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(xs_id))
             max_h = xs[-1][0]
-            heyc = np.linspace(0, max_h, 301)
-            hdif = max_h / 300
+            heyc = np.linspace(0, max_h, NN+1)
+            hdif = max_h / NN
 
             x1_interp = np.interp(0, xs[:, 0], xs[:, 1])
             x2_interp = np.interp(0, xs[:, 0], xs[:, 2])
@@ -2203,12 +2250,13 @@ class SingleChannel(object):
 
     def convey_table_calc(self):
         self.conveyTable = []
+        NN = 300
 
         for i in range(self.nodeNo):
             xs_id = self.geo['xsInfo'][i]
             xs = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(xs_id))
             max_h = xs[-1][0]
-            heyc = np.linspace(0, max_h, 301)
+            heyc = np.linspace(0, max_h, NN + 1)
 
             H = xs[1, 0]
             twcc = xs[-1,2] - xs[-1,1]
@@ -2233,14 +2281,15 @@ class SingleChannel(object):
 
     def qbar_cbar_dbar_save(self):
         self.bar_params = [None] * self.nodeNo
+        NN = 300
 
         for i in range(self.nodeNo):
             # if i == 52:
             #     continue
             xs_id = self.geo['xsInfo'][i]
             max_h = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(xs_id))[-1][0]
-            heyc = np.linspace(0, max_h, 301)
-            hdif = max_h / 300
+            heyc = np.linspace(0, max_h, NN + 1)
+            hdif = max_h / NN
 
             qbar = np.zeros(len(heyc))
             dqbar_dh = np.zeros(len(heyc))
