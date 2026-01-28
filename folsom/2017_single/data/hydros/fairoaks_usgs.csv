@@ -1,0 +1,50 @@
+# ---------------------------------- WARNING ----------------------------------------
+# Some of the data that you have obtained from this U.S. Geological Survey database 
+# may not have received Director's approval. Any such data values are qualified
+# as provisional and are subject to revision. Provisional data are released on the
+# condition that neither the USGS nor the United States Government may be held liable
+# for any damages resulting from its use.
+#
+# Additional info: https://waterdata.usgs.gov/provisional-data-statement/
+#
+# Contact:   gs-w_waterdata_support@usgs.gov
+# retrieved: 2026-01-27 23:10:08 EST       (caww02)
+#
+# Data for the following 1 site(s) are contained in this file
+#    USGS 11446500 AMERICAN R A FAIR OAKS CA
+# -----------------------------------------------------------------------------------
+#
+# Data provided for site 11446500
+#            TS   parameter     statistic     Description
+#         10977       00060     00003     Discharge, cubic feet per second (Mean)
+#
+# Data-value qualification codes included in this output:
+#     A  Approved for publication -- Processing and review completed.
+# 
+agency_cd	site_no	datetime	10977_00060_00003	10977_00060_00003_cd
+5s	15s	20d	14n	10s
+USGS	11446500	2017-02-01	6240	A
+USGS	11446500	2017-02-02	6990	A
+USGS	11446500	2017-02-03	7200	A
+USGS	11446500	2017-02-04	11900	A
+USGS	11446500	2017-02-05	15200	A
+USGS	11446500	2017-02-06	21100	A
+USGS	11446500	2017-02-07	29900	A
+USGS	11446500	2017-02-08	33400	A
+USGS	11446500	2017-02-09	70600	A
+USGS	11446500	2017-02-10	82400	A
+USGS	11446500	2017-02-11	79500	A
+USGS	11446500	2017-02-12	72400	A
+USGS	11446500	2017-02-13	53800	A
+USGS	11446500	2017-02-14	36000	A
+USGS	11446500	2017-02-15	30100	A
+USGS	11446500	2017-02-16	29600	A
+USGS	11446500	2017-02-17	29500	A
+USGS	11446500	2017-02-18	30100	A
+USGS	11446500	2017-02-19	29800	A
+USGS	11446500	2017-02-20	29900	A
+USGS	11446500	2017-02-21	29500	A
+USGS	11446500	2017-02-22	29400	A
+USGS	11446500	2017-02-23	29400	A
+USGS	11446500	2017-02-24	29500	A
+USGS	11446500	2017-02-25	29800	A

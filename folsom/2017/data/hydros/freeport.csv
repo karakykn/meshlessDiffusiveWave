@@ -1,0 +1,50 @@
+# ---------------------------------- WARNING ----------------------------------------
+# Some of the data that you have obtained from this U.S. Geological Survey database 
+# may not have received Director's approval. Any such data values are qualified
+# as provisional and are subject to revision. Provisional data are released on the
+# condition that neither the USGS nor the United States Government may be held liable
+# for any damages resulting from its use.
+#
+# Additional info: https://waterdata.usgs.gov/provisional-data-statement/
+#
+# Contact:   gs-w_waterdata_support@usgs.gov
+# retrieved: 2026-01-28 01:22:51 EST       (sdww01)
+#
+# Data for the following 1 site(s) are contained in this file
+#    USGS 11447650 SACRAMENTO R A FREEPORT CA
+# -----------------------------------------------------------------------------------
+#
+# Data provided for site 11447650
+#            TS   parameter     statistic     Description
+#         11009       72137     00003     Discharge, tidally filtered, cubic feet per second (Mean)
+#
+# Data-value qualification codes included in this output:
+#     A  Approved for publication -- Processing and review completed.
+# 
+agency_cd	site_no	datetime	11009_72137_00003	11009_72137_00003_cd
+5s	15s	20d	14n	10s
+USGS	11447650	2017-02-01	65900	A
+USGS	11447650	2017-02-02	67600	A
+USGS	11447650	2017-02-03	69400	A
+USGS	11447650	2017-02-04	72300	A
+USGS	11447650	2017-02-05	76900	A
+USGS	11447650	2017-02-06	81600	A
+USGS	11447650	2017-02-07	89800	A
+USGS	11447650	2017-02-08	95200	A
+USGS	11447650	2017-02-09	96200	A
+USGS	11447650	2017-02-10	94000	A
+USGS	11447650	2017-02-11	91600	A
+USGS	11447650	2017-02-12	91500	A
+USGS	11447650	2017-02-13	88400	A
+USGS	11447650	2017-02-14	83400	A
+USGS	11447650	2017-02-15	81800	A
+USGS	11447650	2017-02-16	82100	A
+USGS	11447650	2017-02-17	82200	A
+USGS	11447650	2017-02-18	82300	A
+USGS	11447650	2017-02-19	82000	A
+USGS	11447650	2017-02-20	82100	A
+USGS	11447650	2017-02-21	82500	A
+USGS	11447650	2017-02-22	81600	A
+USGS	11447650	2017-02-23	80900	A
+USGS	11447650	2017-02-24	80900	A
+USGS	11447650	2017-02-25	79900	A

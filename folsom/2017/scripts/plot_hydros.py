@@ -49,54 +49,23 @@ downstreamQs_all = {}
 time_all = {}
 # hec_us_all = {}
 
+titr = ['American River (Folsom to Sacramento)',
+        'Sacramento River (Verona to Sacramento)',
+        'Sacramento River (Sacramento to AB Delta)']
 # --- Loop Over Segments and Plot ---
 for idx, seg in enumerate(segments):
     seg_num = idx + 1
     axQ = axes[idx]  # discharge
     # axH = axes[idx, 1]  # depth
 
-    # --- HEC-RAS file names ---
-    # us_file = os.path.join(hecras_dir, f'us{seg_num}.txt')
-    # ds_file = os.path.join(hecras_dir, f'ds{seg_num}.txt')
+    if idx ==2:
+        df = pd.read_csv(f'../data/hydros/abdelta_usgs.csv', skiprows=24, sep='\t')
+        df['Date'] = pd.to_datetime(df.iloc[:, 2], format='mixed')
+        df['Q-cms'] = df.iloc[:, 3] / 35.31466621266132
+        df['Seconds'] = (df['Date'] - df['Date'].iloc[0]).dt.total_seconds()
+        df['Hours'] = df['Seconds'] / 3600
 
-    # if os.path.exists(us_file) and os.path.exists(ds_file):
-    #     us = pd.read_csv(us_file, sep=r'\s+', header=None)
-    #     ds = pd.read_csv(ds_file, sep=r'\s+', header=None)
-    #
-    #     us_Q = pd.to_numeric(us.iloc[1:, 4], errors='coerce').to_numpy()
-    #     ds_Q = pd.to_numeric(ds.iloc[1:, 4], errors='coerce').to_numpy()
-    #     us_h = pd.to_numeric(us.iloc[1:, 3], errors='coerce').to_numpy()
-    #     ds_h = pd.to_numeric(ds.iloc[1:, 3], errors='coerce').to_numpy()
-    #
-    #     totalTime = 86400
-    #     timeHec = np.linspace(0, totalTime / 3600, len(ds_Q))
-    #
-    #     # --- Plot discharge (HEC-RAS) ---
-    #     if idx == 2:
-    #         axQ.plot(timeHec, us_Q, label='Upstream (Dynamic)', linewidth=.8, color='b', zorder=14)
-    #     else:
-    #         axQ.plot(timeHec, us_Q, 'k', label='Upstream', linewidth=.8, zorder=14)
-    #     axQ.plot(timeHec, ds_Q, label='Downstream (Dynamic)', linewidth=1.6, color='b', zorder=19)
-    #
-    #     # --- Convert elevations → depths and plot (HEC-RAS) ---
-    #     h_us = us_h - elevations[idx]['us']
-    #     h_ds = ds_h - elevations[idx]['ds']
-
-        # if idx == 2:
-        #     axH.plot(timeHec, h_us, 'k--', label='Upstream (Dynamic)', linewidth=.8)
-        # else:
-        #     axH.plot(timeHec, h_us, 'k--', label='Upstream (Dynamic)', linewidth=.8)
-        # axH.plot(timeHec, h_ds, 'k--', label='Downstream (Dynamic)', linewidth=1.6)
-
-        # Save downstream HEC for MPE
-        # hec_us_all[idx] = (timeHec, us_Q)
-
-    # print(f'---------- Channel {idx} ----------')
-    #
-    # mass_in = simpson(us_Q, timeHec * 3600)
-    # mass_out = simpson(ds_Q, timeHec * 3600)
-    # mbe_p = (mass_in - mass_out) / mass_in * 100
-    # print(f'Mass balance error (Hec): {mbe_p:.2f}%')
+        axQ.plot(df['Hours'], df['Q-cms'], label='USGS (Gage: 11447890)', marker='o', linestyle='None', markersize=1.6, color='b', zorder=3)
 
     # --- Meshless Model Results ---
     segmentPath = os.path.join(caseName, seg, 'run')
@@ -148,12 +117,20 @@ for idx, seg in enumerate(segments):
         # --- Plot Upstream (now for all channels) ---
         if idx == 2 and len(upstreamQ_Meshless) == len(timeValues):
             axQ.plot(timeValues / 3600, upstreamQ_Meshless, 'k', label='Upstream (Meshless)', linewidth=.8, zorder=15)
+
+        else:
+            axQ.plot(timeValues / 3600, upstreamQ_Meshless, 'k', label='Upstream', linewidth=.8, zorder=14)
         # if len(upstreamH_Meshless) == len(timeValues):
         #     axH.plot(timeValues / 3600, upstreamH_Meshless, 'k', label='Upstream (Meshless)', linewidth=.8)
 
+
         # --- Plot Downstream ---
         axQ.plot(timeValues / 3600, downstreamQ, 'k', label='Downstream (Meshless)', linewidth=1.6, zorder = 20)
-        # axH.plot(timeValues / 3600, downstreamH, 'k', label='Downstream (Meshless)', linewidth=1.6)
+        # axH.plot(timeValues / 3600, downstreamH, 'k', label='Downstream (Meshless)', linewidth=
+
+        if idx == 1:
+            # yyy = np.ones(len(timeValues)) * 2200
+            axes[2].plot(timeValues / 3600, downstreamQ, 'r', label='D', linewidth=1.6, zorder=20)
 
     # --- NWM Results (discharge only) ---
     # x_file = os.path.join(nwm_dir, f't_dsQ_CNX')
@@ -180,7 +157,7 @@ for idx, seg in enumerate(segments):
     # axH.set_xlim([0, 24])
     axQ.set_ylabel(r'Discharge (cms)')
     # axH.set_ylabel(r'h (m)')
-    axQ.set_title(f'Channel {seg_num}')
+    axQ.set_title(f'{titr[idx]}')
     # axH.set_title(f'Channel {seg_num}')
     axQ.legend(frameon=False, fontsize=9) if idx == 2 else axQ.legend(frameon=False, fontsize=12)
     # axH.legend(frameon=False)

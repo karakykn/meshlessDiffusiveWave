@@ -1,0 +1,50 @@
+# ---------------------------------- WARNING ----------------------------------------
+# Some of the data that you have obtained from this U.S. Geological Survey database 
+# may not have received Director's approval. Any such data values are qualified
+# as provisional and are subject to revision. Provisional data are released on the
+# condition that neither the USGS nor the United States Government may be held liable
+# for any damages resulting from its use.
+#
+# Additional info: https://waterdata.usgs.gov/provisional-data-statement/
+#
+# Contact:   gs-w_waterdata_support@usgs.gov
+# retrieved: 2026-01-24 23:25:22 EST       (vaww01)
+#
+# Data for the following 1 site(s) are contained in this file
+#    USGS 11447890 SACRAMENTO R AB DELTA CROSS CHANNEL CA
+# -----------------------------------------------------------------------------------
+#
+# Data provided for site 11447890
+#            TS   parameter     statistic     Description
+#         11038       72137     00003     Discharge, tidally filtered, cubic feet per second (Mean)
+#
+# Data-value qualification codes included in this output:
+#     A  Approved for publication -- Processing and review completed.
+# 
+agency_cd	site_no	datetime	11038_72137_00003	11038_72137_00003_cd
+5s	15s	20d	14n	10s
+USGS	11447890	2017-02-01	37400	A
+USGS	11447890	2017-02-02	37700	A
+USGS	11447890	2017-02-03	38300	A
+USGS	11447890	2017-02-04	39700	A
+USGS	11447890	2017-02-05	41500	A
+USGS	11447890	2017-02-06	43600	A
+USGS	11447890	2017-02-07	47700	A
+USGS	11447890	2017-02-08	50700	A
+USGS	11447890	2017-02-09	51500	A
+USGS	11447890	2017-02-10	51400	A
+USGS	11447890	2017-02-11	51500	A
+USGS	11447890	2017-02-12	51400	A
+USGS	11447890	2017-02-13	49400	A
+USGS	11447890	2017-02-14	46400	A
+USGS	11447890	2017-02-15	44800	A
+USGS	11447890	2017-02-16	44500	A
+USGS	11447890	2017-02-17	44500	A
+USGS	11447890	2017-02-18	44700	A
+USGS	11447890	2017-02-19	44600	A
+USGS	11447890	2017-02-20	44700	A
+USGS	11447890	2017-02-21	45100	A
+USGS	11447890	2017-02-22	45000	A
+USGS	11447890	2017-02-23	44400	A
+USGS	11447890	2017-02-24	44000	A
+USGS	11447890	2017-02-25	43500	A

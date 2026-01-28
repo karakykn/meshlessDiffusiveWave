@@ -1,0 +1,17 @@
+CFL
+0.95
+
+RBFtype (0=TPS, 1=MQ, 2=IMQ, MQ recommended)
+1
+
+shape parameter coefficient (c = x r_av), x:
+32
+
+simEndTime (seconds)
+2066400.0
+
+printStep
+100
+
+downstream bc (0: normal flow, 1: flow depth specified):
+0

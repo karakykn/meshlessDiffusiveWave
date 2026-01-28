@@ -141,7 +141,7 @@ class Network(object):
                 iter += 1
 
                 for i in self.calcOrder:
-                    # self.segments[i].readLateral(0)
+                    self.segments[i].readLateral(0, dt)
                     self.segments[i].solveSeg_CN_warmup(dt, self.segDownstreamInfo[i])
                     for j in self.segDownstreamInfo[i]:
                         self.set_junctionbc_null(j)
@@ -1842,7 +1842,6 @@ class SingleChannel(object):
                                                         + self.geo['nodes'][1:self.nodeNo - 1] ** 2
 
         # self.sys[self.nodeNo-1, :] = self.fx[self.nodeNo-1, :]
-
         self.sys[self.nodeNo-1, :self.nodeNo] = self.f[self.nodeNo-1, :self.nodeNo] + dt * theta * (carpim_adv[-1, :])
         self.sys[self.nodeNo - 1, self.nodeNo] = 1
         self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][-1] + dt * theta * self.cele[-1]
@@ -1881,7 +1880,7 @@ class SingleChannel(object):
         lat = self.cele * self.lat
 
         self.rhs[0] = self.Q[0]
-        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + lat[1:-1] * dt
+        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1])
         self.rhs[self.nodeNo - 1] = 0
         # self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
 
