@@ -127,7 +127,7 @@ class Network(object):
             while True:
                 dt = 1e8
                 for i in range(self.num_segments):
-                    # self.segments[i].readLateral(0)
+                    self.segments[i].readLateral(0, dt)
                     self.segments[i].Q[0] = self.segments[i].read_upstream_Q(0)
                     self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
                     # self.segments[i].update_params_cappaleare2(self.segDownstreamInfo[i])
@@ -1554,6 +1554,9 @@ class SingleChannel(object):
             dist = np.abs(x_nodes - x0)
             idx0 = np.argmin(dist)
 
+            if 'diversion' in L['name']:
+                Ql = -self.Q[idx0]
+
             sigmaC = 2.5e-2
 
             L_tot = x_nodes[-1] - x_nodes[0]  # total length of active reach
@@ -1625,7 +1628,7 @@ class SingleChannel(object):
 
             # dumcor = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
             # self.COR[i] = dumcor if (np.isnan(dumcor) == False) else self.COR[i]
-            arg = 1 - 2 * difbar / max(1e-12, celebar) / max(1e-9, self.Q[i]) * self.dQdx[i]
+            arg = 1 - 2 * difbar / max(1e-12, celebar) / max(1e-9, np.abs(self.Q[i])) * self.dQdx[i]
             self.COR[i] = np.sqrt(np.maximum(1e-8, arg))
             # print(self.COR)
             # self.COR[i] = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
@@ -1643,7 +1646,7 @@ class SingleChannel(object):
         for i in dInfo:
             # dumcor = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
             # self.COR[i] = dumcor if (np.isnan(dumcor) == False) else self.COR[i]
-            arg = 1 - 2 * difbar / max(1e-12, celebar) / max(1e-9, self.Q[-1]) * self.dQdx[-1]
+            arg = 1 - 2 * difbar / max(1e-12, celebar) / max(1e-9, np.abs(self.Q[-1])) * self.dQdx[-1]
             self.COR[-1] = np.sqrt(np.maximum(1e-8, arg))
             # self.COR[-1] = np.sqrt(1 - 2 * difbar / celebar / self.Q[-1] * self.dQdx[-1])
 
@@ -1880,7 +1883,7 @@ class SingleChannel(object):
         lat = self.cele * self.lat
 
         self.rhs[0] = self.Q[0]
-        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1])
+        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + dt * self.lat[1:-1]
         self.rhs[self.nodeNo - 1] = 0
         # self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
 

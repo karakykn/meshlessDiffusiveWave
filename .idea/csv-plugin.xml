@@ -45,27 +45,6 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="/folsom/2017_deepwatershipchannel/data/hydros/yolobypass.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="&#9;" />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/folsom/data/hydros/folsom_hourly_outflow.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="/folsom/data/hydros/verona_usgs.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
       </map>
     </option>
   </component>
