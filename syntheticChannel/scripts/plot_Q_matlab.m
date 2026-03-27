@@ -3,51 +3,75 @@ clear; close all; clc;
 
 %% Case folder
 caseName = '../';
-set(groot, 'DefaultAxesFontName','Helvetica', ...
-    'DefaultAxesFontSize',12);
+%% -------------------------
+% Global plotting parameters
+%% -------------------------
+set(groot, ...
+    'DefaultAxesFontName',        'Helvetica', ...
+    'DefaultAxesFontSize',        16, ...
+    'DefaultAxesXColor',          'k', ...
+    'DefaultAxesYColor',          'k', ...
+    'DefaultTextColor',           'k', ...
+    'DefaultLegendFontSize',      12, ...
+    'DefaultLegendTextColor',     'k', ...
+    'DefaultLineLineWidth',       3,...
+    'DefaultLineMarkerSize',      12);
+
 %% -------------------------
 % Read HEC-RAS outputs
 %% -------------------------
-us1_file = fullfile('..','data','ex1_hecras','us1.txt');
-ds1_file = fullfile('..','data','ex1_hecras','ds1.txt');
+file = fullfile('..','data','ex1_hecras','ex1_hec_n80.txt');
 
-us_arr = readmatrix(us1_file);
-ds_arr = readmatrix(ds1_file);
+opts = detectImportOptions(file, 'NumHeaderLines', 10);
+hec = readtable(file, opts);
+hec_up = hec(hec{:,2} == 20000, :);
+hec_down = hec(hec{:,2} == 0, :);
+
+
+% mi_h= [10 27 40 55 80 110 140];
+% mi_c=[15 32 47 55 67 90 125];
+% mi_c2=[6 40 51 63 85 115];
+% mi_m=[1 8 13 18 26 35 49];
+
+mi_h= [17 31 61 112];
+mi_c=[35 53 73 130];
+% mi_c2=[49 85];
+mi_m=[23 41 85];
+
+% date_h = datetime(hec_up{:,3},'InputFormat','ddMMMyyyy');
+% timeHec = hec_up{:,4} ./ 60;
+% % Plot
+% plot(ax1, dateh, hec_grafton{:,6}, ...
+%     'LineStyle','-', ...
+%     'Color','r', ...
+%     'Marker','s', ...
+%     'MarkerIndices', mi, ...
+%     'DisplayName','Dynamic');
 
 % ---- SAFETY: handle 4- or 5-column files ----
 % Expected order (typical HEC-RAS):
 % col 4 = stage, col 5 = discharge
-if size(us_arr,2) >= 5
-    us_Q = us_arr(2:end,5);
-    us_h = us_arr(2:end,4) - 2;
-else
-    us_Q = us_arr(2:end,4);
-    us_h = us_arr(2:end,3) - 2;
-end
-
-if size(ds_arr,2) >= 5
-    ds_Q = ds_arr(2:end,5);
-    ds_h = ds_arr(2:end,4);
-else
-    ds_Q = ds_arr(2:end,4);
-    ds_h = ds_arr(2:end,3);
-end
 
 %% Time axis for HEC-RAS
 totalTime = 86400;                 % seconds
-timeHec = linspace(0,24,length(ds_Q));  % hours
-
+timeHec = linspace(0,24,height(hec_up));  % hours
+m = 8;
 %% -------------------------
 % Plot HEC-RAS
 %% -------------------------
-figure('Units','in','Position',[1 1 7 4]);
+figure('Units','in','Position',[1 1 7 5]);
 hold on;
 
-plot(timeHec, us_Q, 'k', ...
-    'DisplayName','Upstream', 'LineStyle', '--', 'LineWidth', .5);
+plot(timeHec, hec_up{:,3}, 'b', ...
+    'DisplayName','Upstream inflow', 'LineStyle', ':', 'LineWidth',3.5);
 
-plot(timeHec, ds_Q, 'b', ...
-    'DisplayName','Downstream (Dynamic)', 'Marker','s', 'Color','red','MarkerIndices',1:6:length(timeHec), 'LineWidth', 1.2);
+plot(timeHec, hec_down{:,3}, ...
+        'Color', 'r', ...
+    'DisplayName','Dynamic (HEC-RAS)', ...
+    'MarkerIndices', mi_h, ...
+    'Marker','s', ...
+    'LineStyle','--', ...
+    'MarkerFaceColor','red');
 
 %% -------------------------
 % Read NWM files
@@ -58,11 +82,16 @@ nwm_file_t = fullfile('..','data','ex1_nwm','t_dsQ_CNT');
 nwm_x = readmatrix(nwm_file_x,'NumHeaderLines',1);
 nwm_t = readmatrix(nwm_file_t,'NumHeaderLines',1);
 
-plot(nwm_x(:,1)/3600, nwm_x(:,2), 'Color','m', ...
-    'DisplayName','Downstream (CNS - Beg et al. 2023)', 'Marker','^','MarkerIndices',1:6:length(timeHec), 'LineWidth', 1.2);
-
-plot(nwm_t(:,1)/3600, nwm_t(:,2), 'Color',[1 0.5 0], ...
-    'DisplayName','Downstream (CNT - Beg et al. 2023)', 'Marker','v','MarkerIndices',1:4:length(timeHec), 'LineWidth', 1.2);
+plot(nwm_x(:,1)/3600, nwm_x(:,2), ...
+    'Color', 'm', ...
+    'DisplayName','CNS (Beg \it{et. al.} 2023)', ...
+    'MarkerIndices', mi_c, ...
+    'Marker','^', ...
+    'LineStyle','-.', ...
+    'MarkerFaceColor','m');
+mi=[35 72 130];
+% plot(nwm_t(:,1)/3600, nwm_t(:,2), 'Color',[1 0.5 0], ...
+    % 'DisplayName','CNT - Downstream', 'Marker','v', 'MarkerFaceColor',[1 0.5 0],'MarkerIndices',mi_c2);
 
 %% -------------------------
 % Loop over Meshless segments
@@ -106,15 +135,20 @@ for i = 1:length(segmentDirs)
     [tvals, idx] = sort(tvals);
     downQ = downQ(idx);
 
-    plot(tvals/3600, downQ, 'k', ...
-        'DisplayName','Downstream (Meshless)', 'Marker','o','MarkerIndices',1:3:length(timeHec), 'LineWidth', 1.2);
+    plot(tvals/3600, downQ,    'Color', 'k', ...
+    'DisplayName','Meshless', ...
+    'MarkerIndices', mi_m, ...
+    'Marker','o', ...
+    'MarkerFaceColor','k');
 end
 
 %% -------------------------
 % Final formatting
 %% -------------------------
 xlim([0 24]);
-ylim([19 26]);
+ylim([19.5 25.5]);
 xlabel('Time (hr)');
-ylabel('Discharge (cms)');
-legend('Location','best');
+ylabel('Discharge (m^3/s)');
+legend('Location','northeast');
+box on
+exportgraphics(gcf,'ex1_Q.pdf','ContentType','vector');

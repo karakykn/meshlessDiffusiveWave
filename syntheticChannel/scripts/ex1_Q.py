@@ -4,6 +4,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.integrate import simpson
 
+def trapezoidal(y, x):
+    n = len(x)
+    dx = np.zeros(n-1)
+    dx[:] = x[1:] - x[:-1]
+    coef = np.zeros(n)
+    coef[:-1] = dx[:]
+    coef[-1] = dx[-1]
+    coef[1:-1] += dx[1:]
+    return np.sum(y*coef)/2
+
 def rmse(exact, approx):
     return np.sqrt(np.sum((exact-approx) ** 2) / len(exact))
 
@@ -23,18 +33,19 @@ caseName = '../'
 
 # Read us1 and ds1 (HEC-RAS outputs)
 us1_file = os.path.join('..', 'data', 'ex1_hecras', 'us1.txt')
-ds1_file = os.path.join('..', 'data', 'ex1_hecras', 'ds1.txt')
+ds1_file = os.path.join('..', 'data', 'ex1_hecras', 'ex1_hec_n80.txt')
 
 us1 = pd.read_csv(us1_file, delim_whitespace=True, header=None)
-ds1 = pd.read_csv(ds1_file, delim_whitespace=True, header=None)
+ds1 = pd.read_csv(ds1_file, delim_whitespace=True, header=None, skiprows=12)
 
 us_arr = us1.to_numpy()
 us_Q = pd.to_numeric(us_arr[1:, 4], errors='coerce')
 us_h = pd.to_numeric(us_arr[1:, 3], errors='coerce') - 2
 
 ds_arr = ds1.to_numpy()
-ds_Q = pd.to_numeric(ds_arr[1:, 4], errors='coerce')
-ds_h = pd.to_numeric(ds_arr[1:, 3], errors='coerce')
+ds_arr = ds_arr[ds_arr[:,1]==0]
+ds_Q = pd.to_numeric(ds_arr[:, 2], errors='coerce')
+# ds_h = pd.to_numeric(ds_arr[1:, 3], errors='coerce')
 
 # Initialize arrays
 hecupQ = np.zeros(len(ds_Q))
@@ -45,7 +56,7 @@ hecdownh = np.zeros(len(ds_Q))
 hecupQ[:] = us_Q
 hecdownQ[:] = ds_Q
 hecuph[:] = us_h
-hecdownh[:] = ds_h
+# hecdownh[:] = ds_h
 
 # Time axis for HEC-RAS
 totalTime = 86400
@@ -129,7 +140,7 @@ for seg in segments:
 
 # Axis formatting
 mass_in = 7200 * 242.5
-mass_out = simpson(downstreamQ, timeValues)
+mass_out = trapezoidal(downstreamQ, timeValues)
 mass_balance_error = ((mass_in - mass_out) / mass_in) * 100
 
 mass_in = 7200 * 242.5 / 3600

@@ -126,8 +126,8 @@ README_PATH = Path("/mnt/data/route_link_to_meshless_README.txt")
 route_path = f'../../../Research/Diffusive Wave RBFCM/routelink/RouteLink_CONUS.nc'
 route = read_routelink(route_path)
 
-ids = 3601942 # illinois up
-# ids = 2938485 # mississippi up
+#vids = 3601942 # illinois up
+ids = 882686 # mississippi up
 # ids = 6013250 # missouri up
 
 levels = upstream_ids_numpy(route, ids, depth=100)

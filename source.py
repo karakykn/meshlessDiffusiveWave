@@ -270,7 +270,7 @@ class Network(object):
     def solve(self):
         iter = 0
         if self.time_integrator == 0:
-            omega = .07
+            omega = .075
             dt_old = 0
             while self.time < self.simEndTime:
                 dt = 1e8

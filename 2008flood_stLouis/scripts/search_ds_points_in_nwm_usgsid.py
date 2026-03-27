@@ -78,8 +78,6 @@ def read_routelink(path: str) -> Dict[str, Any]:
     return dict(link=link, to=to, lat=lat, lon=lon,
                 B=B, z=z, n=n_mann, nCC=n_cc, Tw=Tw, TwCC=Twcc, Length=length, alt = alt, So = S0, gages=gages)
 
-import pandas as pd
-
 def downstream_chain_to_csv(route, start_link, filename='downstream_chain.csv', save=True):
     """
     Follow downstream links from start_link using route['to'] mapping,
@@ -194,5 +192,5 @@ def downstream_chain_to_csv(route, start_link, filename='downstream_chain.csv', 
 
 route_path = f'../../../Research/Diffusive Wave RBFCM/routelink/RouteLink_CONUS.nc'
 route = read_routelink(route_path)
-id = 3598322
-df_out = downstream_chain_to_csv(route, id, filename='../data/from_valleycity_illinois.csv')
+id = 2507307
+df_out = downstream_chain_to_csv(route, id, filename='/Users/ismetkarakan/Documents/Doctorate/Research/Probabilistic Modelling of Floods/1dRoute/cluivreTroy_lng.csv')

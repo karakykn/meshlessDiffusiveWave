@@ -292,6 +292,19 @@ hec_grafton['discharge-cms'] = hec_grafton['Q-cms']
 hec_stCharles['discharge-cms'] = hec_stCharles['Q-cms']
 hec_stLouis['discharge-cms'] = hec_stLouis['Q-cms']
 
+# hec = pd.read_fwf('../data/hydros/ex4_hecresults/ex4_denser.txt', skiprows=10, sep=r"\s+", engine="python")
+# hec = hec[hec.iloc[:,4] == 0]
+# hec['date'] = pd.to_datetime(hec.iloc[:,3], format='%d%b%Y')
+# hec['seconds'] = (hec['date'] - hec['date'][0]).dt.total_seconds()
+# hec['discharge-cms'] = hec['(m3/s)']
+# # hec['Q-cms'] = hec.iloc[:,5]
+# hec_grafton = hec[hec.iloc[:,2] == 173029]
+# hec_grafton = hec_grafton[['seconds', 'discharge-cms']]
+# hec_stCharles = hec[hec.iloc[:,2] == 39912]
+# hec_stCharles = hec_stCharles[['seconds', 'discharge-cms']]
+# hec_stLouis = hec[hec.iloc[:,2] == 111687]
+# hec_stLouis = hec_stLouis[['seconds', 'discharge-cms']]
+
 compute_errors("Grafton", usgs_grafton, hec_grafton)
 compute_errors("St. Charles", usgs_stCharles, hec_stCharles)
 compute_errors("St. Louis", usgs_stLouis, hec_stLouis)
@@ -304,7 +317,7 @@ axes[2].xaxis.set_major_locator(
 )
 axes[2].xaxis.set_minor_locator(mdates.MonthLocator())
 # plt.savefig('ex4plot.pdf')
-plt.show()
+# plt.show()
 
 # plt.plot(df['Date'], df['Q-cms'])
 # plt.show()

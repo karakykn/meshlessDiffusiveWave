@@ -1,17 +1,11 @@
 from source import *
 
 # caseName = 'syntheticNetwork'
-# caseName = 'syntheticChannel'
+caseName = 'syntheticChannel'
 # caseName = 'lowerMississippi'
-caseName = '2008flood_stLouis'
-# caseName = 'folsom/2017'
-# caseName = 'folsom/2017_single'
+# caseName = '2008flood_stLouis'
 
 solver = Network(caseName)
-# solver.warmup(tol = 1e-3)
+# solver.warmup(tol = 1e-8)
 solver.solve()
-
-# solver.warmup2(tol = 1e-3)
-# solver.solve2()
-
 

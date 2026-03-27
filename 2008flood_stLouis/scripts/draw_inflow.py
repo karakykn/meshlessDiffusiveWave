@@ -24,9 +24,9 @@ df['date'] = pd.to_datetime(df['20d'], format='%Y-%m-%d')
 df['Q-cms'] = df['14n'] / 35.31466621266132
 df['seconds'] = (df['date'] - df['date'].iloc[0]).dt.total_seconds()
 # print(df)
-# df_to_save = df[['seconds', 'Q-cms']]
+df_to_save = df[['seconds', 'Q-cms']]
 # df_to_save.to_csv('../segment2/geo/boundary_Q', header=None, index=False, sep=' ')
-# df_to_save.to_csv(f'../data/hydros/to_hec/valleyCity_flow', columns=['Q-cms'], header=None, index=False, sep=' ')
+df_to_save.to_csv(f'../data/hydros/to_hec/valleyCity_flow.csv', columns=['date', 'Q-cms'], header=None, index=False, sep=' ')
 df.to_csv('valleycity_inflow', columns=['date', 'Q-cms'])
 ax1.plot(df['date'], df['Q-cms'], 'r', zorder=2, label='Inflow at Valley City, Illinois', linewidth=1.6, color='b', alpha=1)
 

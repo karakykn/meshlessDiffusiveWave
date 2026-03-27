@@ -192,7 +192,7 @@ ax.xaxis.set_major_locator(
 )
 ax.xaxis.set_minor_locator(mdates.MonthLocator())
 # plt.savefig('ex3.pdf')
-plt.show()
+# plt.show()
 
 # ---- MASS BALANCE & ERROR CALCS for both sites ----
 # mass_in computed from observation_tarbert as in your code
@@ -253,3 +253,17 @@ def mpe(exact, approx):
 # compute errors for Baton and Belle
 compute_errors("Baton Rouge", observation_baton, Meshless_baton, CNX_baton)
 compute_errors("Belle Chasse", observation_belle, Meshless_belle, CNX_belle)
+
+hec = pd.read_fwf('../data/hec/lmr_hec_dense.txt', skiprows=10, sep=r"\s+", engine="python")
+hec = hec[hec.iloc[:,4] == 0]
+hec['date'] = pd.to_datetime(hec.iloc[:,3], format='%d%b%Y')
+hec['seconds'] = (hec['date'] - hec['date'][0]).dt.total_seconds()
+hec['discharge-cms'] = hec['(m3/s)']
+# hec['Q-cms'] = hec.iloc[:,5]
+hec_baton = hec[hec.iloc[:,2] == '404330.*']
+hec_baton = hec_baton[['seconds', 'discharge-cms']]
+hec_belle = hec[hec.iloc[:,2] == '159930.*']
+hec_belle = hec_belle[['seconds', 'discharge-cms']]
+
+compute_errors("Baton Rouge", observation_baton, hec_baton, CNX_baton)
+compute_errors("Belle Chasse", observation_belle, hec_belle, CNX_belle)
