@@ -6,6 +6,104 @@ import pandas as pd
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 
+# ---------------------------------------------------------------------------------------------
+# Helpers added for computational efficiency (tier-1 refactor). They reproduce what the original
+# code computed; only the way it is computed changed.
+# ---------------------------------------------------------------------------------------------
+def _interp_table(x, tab, rows):
+    """Row-wise, vectorised np.interp.
+
+    For every node i it returns np.interp(x[i], tab[i, 0, :], tab[i, r, :]) for each r in `rows`,
+    as an array of shape (len(rows), n). It replaces the per-node np.interp loops. The arithmetic
+    follows numpy's interp (clamping at both ends, exact hits on grid points, NaN handling).
+    """
+    xp = tab[:, 0, :]
+    n, m = xp.shape
+    node = np.arange(n)
+    j = np.count_nonzero(xp <= x[:, None], axis=1) - 1      # last grid point <= x (-1: below table)
+    jc = np.clip(j, 0, m - 2)
+    x0 = xp[node, jc]
+    x1 = xp[node, jc + 1]
+    r = np.asarray(rows)[:, None]
+    y0 = tab[node, r, jc]                                     # shape (len(rows), n)
+    y1 = tab[node, r, jc + 1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        slope = (y1 - y0) / (x1 - x0)
+        out = slope * (x - x0) + y0
+        bad = np.isnan(out)
+        if bad.any():                                         # same fallback as numpy
+            out = np.where(bad, slope * (x - x1) + y1, out)
+            out = np.where(bad & np.isnan(out) & (y0 == y1), y0, out)
+    out = np.where(x0 == x, y0, out)                          # exactly on a grid point
+    out = np.where(j < 0, tab[node, r, 0], out)               # below the table
+    out = np.where(j >= m - 1, tab[node, r, m - 1], out)      # at / above the top of the table
+    return np.where(np.isnan(x), x, out)
+
+
+def _write_column(path, arr):
+    """Same bytes as np.savetxt(path, arr) for a 1-D float array, without its per-call overhead."""
+    with open(path, 'w') as fh:
+        fh.write(''.join(['%.18e\n' % v for v in arr]))
+
+
+class _JunctionSeries(object):
+    """In-memory version of a junction boundary file (rows of [time, value]).
+
+    Junction boundary conditions used to be passed between segments through
+    segment{j}/geo/boundary_Q and boundary_h, which were read and rewritten on every call.
+    The same records are now kept here, with the same update rules, and Network mirrors them to
+    those files at every print step and at the end of solve().
+    """
+    __slots__ = ('t', 'v', '_pos')
+
+    def __init__(self):
+        self.t, self.v, self._pos = [], [], {}
+
+    def _append(self, time, val):
+        self._pos[time] = len(self.t)
+        self.t.append(time)
+        self.v.append(val)
+
+    def add(self, time, val):
+        """value(time) += val, or a new row if the time is not recorded yet (update_junction_Q)."""
+        k = self._pos.get(time)
+        if k is None:
+            self._append(time, val)
+        else:
+            self.v[k] = self.v[k] + val
+
+    def set(self, time, val):
+        """value(time) = val, or a new row if the time is not recorded yet."""
+        k = self._pos.get(time)
+        if k is None:
+            self._append(time, val)
+        else:
+            self.v[k] = val
+
+    def value_at(self, time):
+        """np.interp over the record; an exactly recorded time is returned directly."""
+        k = self._pos.get(time)
+        if k is not None:
+            return self.v[k]
+        return np.interp(time, np.asarray(self.t, dtype=float), np.asarray(self.v, dtype=float))
+
+    def trim(self, pS):
+        """same as the old clear_boundaryDocs: drop the last pS rows, keep the latest one."""
+        last_t, last_v = self.t[-1], self.v[-1]
+        self.t = self.t[:-pS] + [last_t]
+        self.v = self.v[:-pS] + [last_v]
+        self._pos = {t: k for k, t in enumerate(self.t)}
+
+    def as_array(self):
+        return np.column_stack([np.asarray(self.t, dtype=float), np.asarray(self.v, dtype=float)])
+
+    def load(self, path):
+        data = np.loadtxt(path, ndmin=2)
+        self.t = list(data[:, 0]) if data.size else []
+        self.v = list(data[:, 1]) if data.size else []
+        self._pos = {t: k for k, t in enumerate(self.t)}
+
+
 class Network(object):
     def __init__(self, caseName, g=9.81):
         self.caseName = caseName
@@ -170,6 +268,7 @@ class Network(object):
 
                 print(f'Residual (%): {np.max(res):.5f}, Iteration: {iter}')
                 if (np.max(res) < tol and iter>10) or iter>999:
+                    self._flush_junction_files()
                     for i in range(self.num_segments):
                         np.savetxt(f"{self.caseName}/segment{i}/run/0/h", self.segments[i].h[:])
                         # np.savetxt(f"{self.caseName}/segment{i}/run/0/Q", self.segments[i].Q[:])
@@ -179,6 +278,7 @@ class Network(object):
                         Qini = np.loadtxt(f"{self.caseName}/segment{i}/run/0/Q")
                         rmse = np.sqrt(np.sum((self.segments[i].Q - Qini) ** 2 / len(Qini)))
                         print(f'Simulation warmed up in {iter} iterations. Deviation in Q of channel {i}: {rmse:.6f}')
+                    self._reload_boundaries_after_warmup()
                     break
 
     def warmup2(self, tol = 1e-2):
@@ -256,6 +356,7 @@ class Network(object):
 
                 print(f'Residual (%): {np.max(res):.5f}, Iteration: {iter}')
                 if (np.max(res) < tol and iter > 10) or iter > 999:
+                    self._flush_junction_files()
                     for i in range(self.num_segments):
                         np.savetxt(f"{self.caseName}/segment{i}/run/0/h", self.segments[i].h[:])
                         # np.savetxt(f"{self.caseName}/segment{i}/run/0/Q", self.segments[i].Q[:])
@@ -265,6 +366,7 @@ class Network(object):
                         Qini = np.loadtxt(f"{self.caseName}/segment{i}/run/0/Q")
                         rmse = np.sqrt(np.sum((self.segments[i].Q - Qini) ** 2 / len(Qini)))
                         print(f'Simulation warmed up in {iter} iterations. Deviation in Q of channel {i}: {rmse:.6f}')
+                    self._reload_boundaries_after_warmup()
                     break
 
     def solve(self):
@@ -280,12 +382,10 @@ class Network(object):
                     self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
                     # self.segments[i].update_params_cappaleare2(self.segDownstreamInfo[i])
 
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
                     # dt_arr[:, 1] = self.segments[i].h[:] * self.segments[i].geo['dx'][:] / (self.segments[i].lat[:] + 1e-8) * .2
                     # dt_arr[:, 1] = self.segments[i].area[:] / (self.segments[i].lat[:] + 1e-8) * .2
                     # dt = min(dt, np.min(np.abs(dt_arr[:, 0])), np.min(np.abs(dt_arr[:, 1])))
-                    dt = min(dt, np.min(np.abs(dt_arr[:, 0])))
+                    dt = min(dt, np.min(np.abs(self.segments[i].geo['dx'][:] / self.segments[i].cele[:])))
                     # cf = np.max(np.abs(self.segments[i].lat / self.segments[i].latLimiter))
                     # dt /= max(1, cf)
 
@@ -294,31 +394,6 @@ class Network(object):
                 dt = self.CFL * dt
                 iter += 1
                 self.time += dt
-
-                jbc = np.zeros(self.num_segments)
-                for i in range(self.num_segments):
-                    for j in self.segDownstreamInfo[i]:
-                        # jbc[i] = self.segments[i].dQdx[-1] + (self.segments[j].cele[0] * dt) / (
-                        #         self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                        #         - self.segments[i].cele[-2] * dt
-                        #         + self.segments[j].cele[0] * dt) \
-                        #          * (self.segments[i].dQdx[-2] - self.segments[j].dQdx[0])
-                        for k in self.segUpstreamInfo[j]:
-                            if i != k:
-                                cele_f = self.segments[i].cele[-1]
-                                dqdx_f = self.segments[j].dQdx[0] - self.segments[k].dQdx[-1]
-                                # jbc[i] = self.segments[i].dQdx[-1] + (cele_f * dt) / (
-                                #         self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                                #         - self.segments[i].cele[-2] * dt
-                                #         + cele_f * dt) \
-                                #          * (self.segments[i].dQdx[-2] - dqdx_f)
-                                # jbc[i] = self.segments[j].cele[0] * self.segments[j].dQdx[0] \
-                                #         -self.segments[i].cele[-1] * self.segments[i].dQdx[-1] \
-                                #          - self.segments[k].cele[-1] * self.segments[k].dQdx[-1]
-                                dx = self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                                coef = dx - self.segments[i].cele[-2] * dt
-                                jbc[i] = self.segments[i].Q[-2] + coef / (coef + dx - self.segments[i].cele[-2] * dt) * \
-                                                                    (self.segments[i].Q[-1] - self.segments[i].Q[-2])
 
                 for i in self.calcOrder:
                     self.segments[i].readLateral(self.time, dt)
@@ -389,8 +464,8 @@ class Network(object):
                         # print(self.segments[i].diffu)
                         time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
                         os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+                        _write_column(f"{time_folder}/h", self.segments[i].h[:])
+                        _write_column(f"{time_folder}/Q", self.segments[i].Q[:])
                         # plt.plot(iter, self.segments[0].dQdx[-1], marker='x', color='k', markersize=3)
                         # plt.plot(iter, self.segments[1].dQdx[-1], marker='x', color='b', markersize=3)
                         # plt.plot(iter, self.segments[2].dQdx[0], marker='x', color='r', markersize=3)
@@ -402,9 +477,10 @@ class Network(object):
                     print(f'----------------------------------------------\n')
             time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
             os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
+            _write_column(f"{time_folder}/h", self.segments[i].h[:])
+            _write_column(f"{time_folder}/Q", self.segments[i].Q[:])
             # plt.show()
+            self._flush_junction_files()
 
     def solve2(self):
         iter = 0
@@ -1046,136 +1122,53 @@ class Network(object):
             np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
             np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
 
+    # ---- junction exchange (in memory, see _JunctionSeries) ---------------------------------
     def update_junction_Q(self, Q, segId):
-        file_path = f"{self.caseName}/segment{segId}/geo/boundary_Q"
-        update_tuple = (self.time, Q)
-
-        try:
-            # Try reading the file
-            with open(file_path, "r") as file:
-                lines = file.readlines()
-        except FileNotFoundError:
-            # If the file doesn't exist, initialize lines as empty
-            lines = []
-
-        updated_lines = []
-        entry_written = False
-
-        for line in lines:
-            parts = line.split()
-            if float(parts[0]) == update_tuple[0]:  # If time matches, update Q
-                parts[1] = str(float(parts[1]) + update_tuple[1])
-                entry_written = True
-            updated_lines.append(" ".join(parts))
-
-        # If no existing entry was updated, append the new tuple
-        if not entry_written:
-            updated_lines.append(f"{update_tuple[0]} {update_tuple[1]}")
-
-        # Write back the updated content
-        with open(file_path, "w") as file:
-            file.write("\n".join(updated_lines) + "\n")
+        '''adds Q to the upstream discharge of segment segId at the current time'''
+        self._jQ[segId].add(self.time, Q)
 
     def set_junctionbc_null(self, segId):
-        '''this piece of code sets discharge to 0 if same time appears in the text file. '''
-        file_path = f"{self.caseName}/segment{segId}/geo/boundary_Q"
-        update_tuple = (self.time, 0)
-
-        try:
-            # Read existing lines
-            with open(file_path, "r") as file:
-                lines = file.readlines()
-        except FileNotFoundError:
-            # If file doesn't exist, start empty
-            lines = []
-
-        updated_lines = []
-        found = False
-
-        for line in lines:
-            # Split existing line into [time, value]
-            parts = line.strip().split()
-            if len(parts) >= 2 and float(parts[0]) == update_tuple[0]:
-                # Replace line if time matches
-                updated_lines.append(f"{update_tuple[0]} {update_tuple[1]}\n")
-                found = True
-            else:
-                updated_lines.append(line)
-
-        if not found:
-            # Append new line if no match was found
-            updated_lines.append(f"{update_tuple[0]} {update_tuple[1]}\n")
-
-        # Write everything back
-        with open(file_path, "w") as file:
-            file.writelines(updated_lines)
+        '''this piece of code sets discharge to 0 if same time appears in the record. '''
+        self._jQ[segId].set(self.time, 0.0)
 
     def update_junction_h(self, h, segId):
-        file_path = f"{self.caseName}/segment{segId}/geo/boundary_h"
-        new_line = f"{self.time} {h}\n"
-
-        lines = []
-        replaced = False
-
-        try:
-            with open(file_path, "r") as file:
-                for line in file:
-                    if line.strip().startswith(f"{self.time} "):
-                        lines.append(new_line)
-                        replaced = True
-                    else:
-                        lines.append(line)
-        except FileNotFoundError:
-            # File does not exist yet
-            pass
-
-        if not replaced:
-            lines.append(new_line)
-
-        with open(file_path, "w") as file:
-            file.writelines(lines)
+        self._jh[segId].set(self.time, h)
 
     def update_junction_h_warmup(self, h, segId):
-        file_path = f"{self.caseName}/segment{segId}/geo/boundary_h"
-        new_line = f"{self.time} {h}\n"
-
-        lines = []
-        replaced = False
-
-        try:
-            with open(file_path, "r") as file:
-                for line in file:
-                    if line.strip().startswith(f"{self.time} "):
-                        lines.append(new_line)
-                        replaced = True
-                    else:
-                        lines.append(line)
-        except FileNotFoundError:
-            # File does not exist yet
-            pass
-
-        if not replaced:
-            lines.append(new_line)
-
-        with open(file_path, "w") as file:
-            file.writelines(lines)
+        self._jh[segId].set(self.time, h)
 
     def reset_junctions(self):
+        self._jQ, self._jh = {}, {}
         for i in self.calcOrder:
             for j in self.segDownstreamInfo[i]:
-                fpath = f"{self.caseName}/segment{j}/geo/boundary_Q"
-                with open(fpath, "w") as file:
-                    pass
-                file.close()
+                self._jQ[j] = _JunctionSeries()
             for j in self.segUpstreamInfo[i]:
-                fpath = f"{self.caseName}/segment{j}/geo/boundary_h"
-                with open(fpath, "w") as file:
-                    pass
-                file.close()
+                self._jh[j] = _JunctionSeries()
                 self.update_junction_h(self.segments[i].h[-1], j)
         for i in self.calcOrder:
             for j in self.segDownstreamInfo[i]:
                 self.update_junction_Q(self.segments[i].Q[-1], j)
+        # the segments read their junction boundary values from these records
+        for k, seg in self.segments.items():
+            seg._upQ_series = self._jQ.get(k)
+            seg._dsh_series = self._jh.get(k)
+        self._flush_junction_files()
+
+    def _flush_junction_files(self):
+        '''mirror the in-memory junction records to segment{j}/geo/boundary_Q and boundary_h'''
+        for j, s in self._jQ.items():
+            np.savetxt(f"{self.caseName}/segment{j}/geo/boundary_Q", s.as_array())
+        for j, s in self._jh.items():
+            np.savetxt(f"{self.caseName}/segment{j}/geo/boundary_h", s.as_array())
+
+    def _reload_boundaries_after_warmup(self):
+        '''warmup rewrites the boundary files on disk: bring the in-memory copies in line'''
+        for j, s in self._jQ.items():
+            s.load(f"{self.caseName}/segment{j}/geo/boundary_Q")
+        for j, s in self._jh.items():
+            s.load(f"{self.caseName}/segment{j}/geo/boundary_h")
+        for seg in self.segments.values():
+            seg._h_boundaries = None
 
     def update_celerity(self, i, dQdx):
         Qbar = np.interp(self.segments[i].h[-1], self.segments[i].bar_params[-1][0, :], self.segments[i].bar_params[-1][1, :])
@@ -1191,19 +1184,10 @@ class Network(object):
 
     def clear_boundaryDocs(self, pS):
         for j in self.upStreams:
-            fPath = f'{self.caseName}/segment{j}/geo/boundary_h'
-            dummy = np.loadtxt(f'{fPath}')
-            dummy2 = dummy[-1, :]
-            dummy = dummy[:-pS, :]
-            dummy = np.append(dummy, [dummy2], axis=0)
-            np.savetxt(f'{fPath}', dummy)
+            self._jh[j].trim(pS)
         for j in self.downStreams:
-            fPath = f'{self.caseName}/segment{j}/geo/boundary_Q'
-            dummy = np.loadtxt(f'{fPath}')
-            dummy2 = dummy[-1, :]
-            dummy = dummy[:-pS, :]
-            dummy = np.append(dummy, [dummy2], axis=0)
-            np.savetxt(f'{fPath}', dummy)
+            self._jQ[j].trim(pS)
+        self._flush_junction_files()
 
 class SingleChannel(object):
     """Radial Basis Function Collocation Method for 1D diffusive wave equation."""
@@ -1212,6 +1196,9 @@ class SingleChannel(object):
         self.caseName = caseName
         self.segmentNo = segmentNo
         self.g = g
+        self._upQ_series = None     # set by Network when the upstream boundary is a junction
+        self._dsh_series = None     # set by Network when the downstream boundary is a junction
+        self._h_boundaries = None   # cached boundary_h (external downstream water levels)
         self.load_geometry()
         self.nodeNo = len(self.geo['nodes'])
         self.xs_param_save()
@@ -1221,6 +1208,21 @@ class SingleChannel(object):
         self.RBFtype = rbf_type
         self.shpC = shpC
         self.compute_RBF_matrix()
+        self._build_fast_tables()
+
+    # rows of bar_params used in update_params_cappaleare: Qbar, D_bar, C_bar, dD_bar/dQbar
+    _BAR_ROWS = np.array([1, 3, 2, 4])
+    # rows of xsParams used in solveSeg_h5: area, top width
+    _XS_ROWS = np.array([3, 1])
+
+    def _build_fast_tables(self):
+        '''stacked lookup tables for the vectorised interpolation, and the constant rows of the CN system'''
+        self._bar_tab = np.ascontiguousarray(np.stack(self.bar_params))                                  # (N, 5, 301)
+        self._xs_tab = np.ascontiguousarray(np.stack([self.xsParams[k] for k in self.geo['xsInfo']]))    # (N, 4, 301)
+        # moment conditions of the CN system (rows N..N+2) never change: set once here
+        self.sys[self.nodeNo, :self.nodeNo] = 1
+        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
+        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
 
     def load_geometry(self):
         """Load geometry-related data for the segment."""
@@ -1537,9 +1539,6 @@ class SingleChannel(object):
             self.qlat_us = 0.0
             return
 
-        x_nodes = self.geo['nodes'].copy()
-        dx_nodes = self.geo['dx'].copy()
-
         for L in getattr(self, 'laterals', []):
             if L is None or 'ts' not in L:
                 continue
@@ -1550,52 +1549,63 @@ class SingleChannel(object):
             if abs(Ql) < 1e-12:
                 continue
 
-            x0 = L['x']
-            dist = np.abs(x_nodes - x0)
-            idx0 = np.argmin(dist)
+            # the spatial weights do not change in time: computed once, then reused
+            if '_w' not in L:
+                L['_idx0'], L['_w'], L['_denom'] = self._lateral_weights(L)
 
             if 'diversion' in L['name']:
-                Ql = -self.Q[idx0]
+                Ql = -self.Q[L['_idx0']]
 
-            sigmaC = 2.5e-2
+            q_per_len = Ql / L['_denom']
 
-            L_tot = x_nodes[-1] - x_nodes[0]  # total length of active reach
-            sigma = sigmaC * L_tot  # base width
-
-            # --- NEW: asymmetric sigmas ---
-            skew_factor = 4  # >1 means more spread downstream
-
-            sigma_up = sigma  # upstream width  (x <= x0)
-            sigma_dn = sigma * skew_factor  # downstream width (x > x0)
-
-            z = x_nodes - x0
-            w = np.empty_like(x_nodes)
-
-            # Upstream side (x <= x0): decays quickly
-            w[z <= 0] = np.exp(-0.5 * (z[z <= 0] / sigma_up) ** 2)
-
-            # Downstream side (x > x0): decays slowly → more mass downstream
-            w[z > 0] = np.exp(-0.5 * (z[z > 0] / sigma_dn) ** 2)
-            w[idx0] = 1
-            # if  L['name'] == 'bohemia':
-            #     w[idx0+1] = 1
-
-            # Keep peak at 1 at x0 (or nearest grid point)
-            w /= w.max()
-            w[0], w[-1] = 0, 0
-
-            # Optional: visualize
-            # plt.plot(x_nodes, w)
-            # plt.axvline(x0, ls='--')
-            # plt.show()
-
-            denom = np.sum(w * dx_nodes)
-            q_per_len = Ql / denom
-
-            self.lat[:] += q_per_len * w[:]
+            self.lat[:] += q_per_len * L['_w'][:]
 
         # coef = 1e3 # higher
         # self.lat[:] = np.sign(self.lat[:]) * np.minimum(np.abs(self.lat[:]), self.oldQ[:] / self.cele[:] / dt / coef)
+
+    def _lateral_weights(self, L):
+        '''spatial distribution of one lateral inflow (moved out of readLateral, unchanged)'''
+        x_nodes = self.geo['nodes'].copy()
+        dx_nodes = self.geo['dx'].copy()
+
+        x0 = L['x']
+        dist = np.abs(x_nodes - x0)
+        idx0 = np.argmin(dist)
+
+        sigmaC = 2.5e-2
+
+        L_tot = x_nodes[-1] - x_nodes[0]  # total length of active reach
+        sigma = sigmaC * L_tot  # base width
+
+        # --- NEW: asymmetric sigmas ---
+        skew_factor = 4  # >1 means more spread downstream
+
+        sigma_up = sigma  # upstream width  (x <= x0)
+        sigma_dn = sigma * skew_factor  # downstream width (x > x0)
+
+        z = x_nodes - x0
+        w = np.empty_like(x_nodes)
+
+        # Upstream side (x <= x0): decays quickly
+        w[z <= 0] = np.exp(-0.5 * (z[z <= 0] / sigma_up) ** 2)
+
+        # Downstream side (x > x0): decays slowly → more mass downstream
+        w[z > 0] = np.exp(-0.5 * (z[z > 0] / sigma_dn) ** 2)
+        w[idx0] = 1
+        # if  L['name'] == 'bohemia':
+        #     w[idx0+1] = 1
+
+        # Keep peak at 1 at x0 (or nearest grid point)
+        w /= w.max()
+        w[0], w[-1] = 0, 0
+
+        # Optional: visualize
+        # plt.plot(x_nodes, w)
+        # plt.axvline(x0, ls='--')
+        # plt.show()
+
+        denom = np.sum(w * dx_nodes)
+        return idx0, w, denom
 
     def update_params(self, diffLim):
         # dQdx = np.matmul(self.fx_invF, self.Q)
@@ -1617,42 +1627,21 @@ class SingleChannel(object):
 
     def update_params_cappaleare(self, dInfo):
         self.dQdx = np.matmul(self.fx_invF, self.Q)
-        self.COR = np.ones_like(self.Q)
-        for i in range(self.nodeNo - 1):
-            Qbar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][1, :])
-            difbar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][3, :])
-            celebar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][2, :])
-            dd_dq = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][4, :])
-            # wp = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0, :], self.xsParams[self.geo['xsInfo'][i]][2, :])
-            # self.hydraulic_depth[i] = self.area[i] / wp
+        # Qbar, D_bar, C_bar and dD_bar/dQbar at every node in one call (was a per-node np.interp loop)
+        Qbar, difbar, celebar, dd_dq = _interp_table(self.h, self._bar_tab, self._BAR_ROWS)
+        # max(1e-12, celebar) and max(1e-9, |Q|), element-wise (same as Python's max, incl. NaN)
+        cel_lim = np.where(celebar > 1e-12, celebar, 1e-12)
+        absQ = np.abs(self.Q)
+        Q_lim = np.where(absQ > 1e-9, absQ, 1e-9)
+        arg = 1 - 2 * difbar / cel_lim / Q_lim * self.dQdx
+        self.COR = np.sqrt(np.maximum(1e-8, arg))
+        if len(dInfo) == 0:
+            # the last node keeps COR = 1 unless the segment drains into a junction
+            self.COR[-1] = 1.0
 
-            # dumcor = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
-            # self.COR[i] = dumcor if (np.isnan(dumcor) == False) else self.COR[i]
-            arg = 1 - 2 * difbar / max(1e-12, celebar) / max(1e-9, np.abs(self.Q[i])) * self.dQdx[i]
-            self.COR[i] = np.sqrt(np.maximum(1e-8, arg))
-            # print(self.COR)
-            # self.COR[i] = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
-
-            self.cele_h[i] = celebar * self.COR[i]
-            self.cele[i] = celebar / 2 * (self.COR[i] * (1 + Qbar / difbar * dd_dq) + 1 / self.COR[i] * (1 - Qbar / difbar * dd_dq))
-            self.diffu[i] = difbar / self.COR[i]
-        Qbar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][1, :])
-        difbar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][3, :])
-        celebar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][2, :])
-        dd_dq = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][4, :])
-        # wp = np.interp(self.h[-1], self.xsParams[self.geo['xsInfo'][-1]][0, :],
-        #                self.xsParams[self.geo['xsInfo'][-1]][2, :])
-        # self.hydraulic_depth[-1] = self.area[-1] / wp
-        for i in dInfo:
-            # dumcor = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
-            # self.COR[i] = dumcor if (np.isnan(dumcor) == False) else self.COR[i]
-            arg = 1 - 2 * difbar / max(1e-12, celebar) / max(1e-9, np.abs(self.Q[-1])) * self.dQdx[-1]
-            self.COR[-1] = np.sqrt(np.maximum(1e-8, arg))
-            # self.COR[-1] = np.sqrt(1 - 2 * difbar / celebar / self.Q[-1] * self.dQdx[-1])
-
-        self.cele_h[-1] = celebar * self.COR[-1]
-        self.cele[-1] = celebar / 2 * (self.COR[-1] * (1 + Qbar / difbar * dd_dq) + 1 / self.COR[-1] * (1 - Qbar / difbar * dd_dq))
-        self.diffu[-1] = difbar / self.COR[-1]
+        self.cele_h[:] = celebar * self.COR
+        self.cele[:] = celebar / 2 * (self.COR * (1 + Qbar / difbar * dd_dq) + 1 / self.COR * (1 - Qbar / difbar * dd_dq))
+        self.diffu[:] = difbar / self.COR
 
     def update_params_cappaleare2(self, dInfo):
         self.dQdx = np.matmul(self.fx_invF, self.Q)
@@ -1821,8 +1810,9 @@ class SingleChannel(object):
         self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
 
     def solveSeg_CN(self, dt, dInfo, theta=.85):
-        adv = np.matmul(np.diag(self.cele), np.matmul(self.fx_invF, self.oldQ)) # switch with self.dqdx for speed
-        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.oldQ))
+        # element-wise products replace np.matmul(np.diag(.), .): same numbers, O(N^2) instead of O(N^3)
+        adv = self.cele * np.matmul(self.fx_invF, self.oldQ) # switch with self.dqdx for speed
+        diff = self.diffu * np.matmul(self.fxx_invF, self.oldQ)
         self.lat = self.cele * self.lat
 
         self.rhs[0] = self.Q[0]
@@ -1833,8 +1823,8 @@ class SingleChannel(object):
         # self.rhs[-1] = self.oldQ[-1] - dt * (1 - theta) * coef * self.dQdx[-1]
         # self.latLimiter = np.abs((1 - theta) * ((-adv + diff)))
 
-        carpim_adv = np.matmul(np.diag(self.cele), self.fx[:,:self.nodeNo])
-        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:,:self.nodeNo])
+        carpim_adv = self.cele[:, None] * self.fx[:, :self.nodeNo]
+        carpim_diffu = self.diffu[:, None] * self.fxx[:, :self.nodeNo]
         self.sys[0, :] = self.f[0, :]
 
         self.sys[1:self.nodeNo-1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
@@ -1851,11 +1841,9 @@ class SingleChannel(object):
         self.sys[self.nodeNo - 1, self.nodeNo + 2] =  2 * self.geo['nodes'][-1] * dt * theta * self.cele[-1] \
                                                         + self.geo['nodes'][-1] ** 2
 
-        self.sys[self.nodeNo, :self.nodeNo] = 1
-        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
+        # rows nodeNo..nodeNo+2 (moment conditions) are constant: set once in _build_fast_tables()
 
-        for i in dInfo:
+        if len(dInfo) > 0:
             # self.rhs[self.nodeNo-1] = 0
             self.rhs[self.nodeNo-1] = self.dQdx[self.nodeNo-1]
             self.sys[self.nodeNo-1, :] = self.fx[-1, :]
@@ -1866,7 +1854,7 @@ class SingleChannel(object):
 
     def solveSeg_CN_sec(self, dt, dInfo, new_xi, theta = .85):
         self.rhs[0] = self.Q[0]
-        for i in dInfo:
+        if len(dInfo) > 0:
             self.rhs[self.nodeNo-1] = new_xi
             # self.sys[self.nodeNo-1, :] = self.fx[-1, :]
         # self.rhs[-1] = -(1 - theta) * self.dQdx[-1] + new_xi
@@ -1878,8 +1866,8 @@ class SingleChannel(object):
         # self.apply_lateral_split(dt)
 
     def solveSeg_CN_warmup(self, dt, dInfo, theta=.85):
-        adv = np.matmul(np.diag(self.cele), np.matmul(self.fx_invF, self.oldQ))
-        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.oldQ))
+        adv = self.cele * np.matmul(self.fx_invF, self.oldQ)
+        diff = self.diffu * np.matmul(self.fxx_invF, self.oldQ)
         lat = self.cele * self.lat
 
         self.rhs[0] = self.Q[0]
@@ -1887,8 +1875,8 @@ class SingleChannel(object):
         self.rhs[self.nodeNo - 1] = 0
         # self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
 
-        carpim_adv = np.matmul(np.diag(self.cele), self.fx[:,:self.nodeNo])
-        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:,:self.nodeNo])
+        carpim_adv = self.cele[:, None] * self.fx[:, :self.nodeNo]
+        carpim_diffu = self.diffu[:, None] * self.fxx[:, :self.nodeNo]
         self.sys[0, :] = self.f[0, :]
 
         self.sys[1:self.nodeNo-1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
@@ -2149,11 +2137,8 @@ class SingleChannel(object):
         RHS[:self.nodeNo-1] = self.geo['slopes'][:-1] * (1 - self.COR[:-1] ** 2)
         RHS[self.nodeNo-1] = self.h[-1]
         self.h = np.matmul(self.hsys, RHS)
-        for i in range(self.nodeNo):
-            self.area[i] = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0, :],
-                                 self.xsParams[self.geo['xsInfo'][i]][3, :])
-            self.topW[i] = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0, :],
-                                 self.xsParams[self.geo['xsInfo'][i]][1, :])
+        # wetted area and top width at every node in one call (was a per-node np.interp loop)
+        self.area[:], self.topW[:] = _interp_table(self.h, self._xs_tab, self._XS_ROWS)
         # self.dhdx = np.matmul(self.fx_invF, self.h)
         # self.d2hdx2 = np.matmul(self.fxx_invF, self.h)
 
@@ -2323,16 +2308,23 @@ class SingleChannel(object):
         # np.savetxt('../Research/Diffusive Wave RBFCM/Q vs CD/qbar_cdbar', np.vstack([qbar,cbar, dbar]))
 
     def read_upstream_Q(self, time):
-        self.Q_boundaries = np.atleast_2d(np.loadtxt(self.geom_path + 'boundary_Q'))
-        # Interpolate Q for the given time
+        if self._upQ_series is not None:
+            # junction: sum of the upstream segments' outflow, kept in memory by Network
+            return self._upQ_series.value_at(time)
+        # external hydrograph: loaded once in initialize_conditions (the file does not change during a run)
         Q_interp = np.interp(time, self.Q_boundaries[:, 0], self.Q_boundaries[:, 1])
 
         return Q_interp
 
     def read_downstream_h(self, time):
-        h_boundaries = np.atleast_2d(np.loadtxt(self.geom_path + 'boundary_h'))
+        if self._dsh_series is not None:
+            # junction: h at the upstream end of the downstream segment, kept in memory by Network
+            return self._dsh_series.value_at(time)
+        if self._h_boundaries is None:
+            # external water levels: read once, then reused
+            self._h_boundaries = np.atleast_2d(np.loadtxt(self.geom_path + 'boundary_h'))
 
         # Interpolate Q for the given time
-        h_interp = np.interp(time, h_boundaries[:, 0], h_boundaries[:, 1])
+        h_interp = np.interp(time, self._h_boundaries[:, 0], self._h_boundaries[:, 1])
 
         return h_interp

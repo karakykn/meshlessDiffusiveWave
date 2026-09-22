@@ -10,6 +10,41 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="/missTribs/1dRoute/hidros/northFabiusnearEwing.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/missTribs/1dRoute/hidros/saltRivefnearnewLondon.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/missTribs/1dRoute/hidros/southFabiusnearTaylor.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/missTribs/1dRoute/northFabius.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/missTribs/salt/scripts/hourly_discharge.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
       </map>
     </option>
   </component>
