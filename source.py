@@ -1,26 +1,79 @@
-import numpy as np
-import os, csv
+"""
+Meshless (RBF collocation) diffusive wave model for a single channel or a dendritic channel network.
+
+Discharge: Q-form of the diffusive wave equation with lateral flow (Cappelaere 1997),
+        dQ/dt + C dQ/dx = D d2Q/dx2 + C q_l - D dq_l/dx.
+A lateral flow Q_l,k(t) at x_k (segment<i>/geo/laterals and lateralDatas; negative for an outflow such as a
+spillway) is a point source, q_l = sum_k Q_l,k delta(x - x_k). With
+        Q = P + G,   G(x, t) = sum_k Q_l,k(t) W_k(x),   W_k = 0 upstream of x_k, 1 downstream (1/2 at a node on x_k),
+the equation becomes dP/dt + C dP/dx = D d2P/dx2 - dG/dt. P is solved with the collocation system and Q = P + G,
+so the lateral flow is never differentiated and leaves the channel exactly.
+
+Parameters: Qbar, Cbar and Dbar are the uniform-flow values at the local depth h (tabulated per node) and
+        Gamma = Q / Qbar(h)
+        C = Cbar / 2 [Gamma (1 + k) + (1 - k) / Gamma],   k = (Qbar / Dbar) dDbar/dQbar   (Cappelaere 1997, Eq. 14a)
+        D = Dbar / |Gamma|.
+Depth: zero-inertia momentum equation, integrated upstream from the downstream depth,
+        dh/dx = S0 - S_f = S0 (1 - Gamma |Gamma|).
+
+Spatial discretization: Kansa's collocation method with the multiquadric (MQ) basis, sqrt(r^2 + c^2), plus a
+quadratic polynomial; c = coef * r_av, r_av = L / (N - 1) the mean node spacing. coef is given per channel in the
+file <case>/shape (one value per segment, written by select_shape_coefficients) or, without that file, by the
+input file for all channels. Time discretization: theta scheme (theta = 0.5: Crank-Nicolson).
+
+One time step (Network.step):
+ 1. C and D at every node from the current Q and h; dt = Courant number * min(dx / C) over the network.
+ 2. Forward (discharge) sequence, from the upstream channels down: the inflow at the upstream end (hydrograph, or
+    the sum of the outflows of the channels draining into the junction) and, at the downstream end, the outflow
+    row dQ/dt + C dQ/dx = 0 at the network outlet, or the junction outflow Q_J of a channel draining into a
+    junction.
+ 3. Junction outflow (networks only): Q_J of every channel draining into a junction satisfies the volume balance
+    of the channel,
+        S^{n+1} - S^n = dt [theta (Q_in - Q_J)^{n+1} + (1 - theta) (Q_in - Q_J)^n] + lateral volume,
+    S = integral of the wetted area A(h) dx. Within a step Q is linear in Q_in and Q_J, and S and the depth at the
+    upstream end of every channel are linearized with the Jacobian of the depth system of the previous step, so all
+    balances form one small linear system for the Q_J. The residual of the linearization is carried into the
+    balance of the next step.
+ 4. Backward (depth) sequence, from the outlet up: the depth at the downstream end (rating curve or prescribed
+    depth at the outlet; at a junction, the depth at the upstream end of the downstream channel), the depths along
+    the channel from the momentum equation (Newton's method), then Gamma = Q / Qbar(h).
+
+Case folder (see README.md): input, network, optional shape, and segment<i>/geo (nodes, slopes, mannings_n, xsInfo,
+xSecs/xs<k>, boundary_Q, boundary_h, optional laterals and lateralDatas) and segment<i>/run/0 (initial Q and h).
+Results are written to segment<i>/run/<time>/Q and h.
+"""
+import csv
+import math
+import os
 import shutil
-from collections import deque, defaultdict
-import pandas as pd
-from scipy.interpolate import interp1d
-import matplotlib.pyplot as plt
+from collections import defaultdict, deque
+from time import perf_counter, process_time
 
-# ---------------------------------------------------------------------------------------------
-# Helpers added for computational efficiency (tier-1 refactor). They reproduce what the original
-# code computed; only the way it is computed changed.
-# ---------------------------------------------------------------------------------------------
+import numpy as np
+
+try:            # LAPACK gesv without the argument checks of np.linalg.solve (same routine, identical results)
+    from numpy.linalg import _umath_linalg as _UL
+
+    def _solve(a, b):
+        return _UL.solve(a, b, signature='dd->d')
+    _solve(np.eye(2), np.ones((2, 1)))
+except Exception:
+    _solve = np.linalg.solve
+
+N_TABLE = 300           # intervals of the depth grid of the cross-section and uniform-flow tables
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Table lookups
+# ---------------------------------------------------------------------------------------------------------------------
 def _interp_table(x, tab, rows):
-    """Row-wise, vectorised np.interp.
-
-    For every node i it returns np.interp(x[i], tab[i, 0, :], tab[i, r, :]) for each r in `rows`,
-    as an array of shape (len(rows), n). It replaces the per-node np.interp loops. The arithmetic
-    follows numpy's interp (clamping at both ends, exact hits on grid points, NaN handling).
-    """
+    """Row-wise, vectorized np.interp: for every node i, np.interp(x[i], tab[i, 0, :], tab[i, r, :]) for each r in
+    rows, as an array of shape (len(rows), n). Same arithmetic as np.interp (clamping at both ends, exact hits on
+    grid points, NaN handling)."""
     xp = tab[:, 0, :]
     n, m = xp.shape
     node = np.arange(n)
-    j = np.count_nonzero(xp <= x[:, None], axis=1) - 1      # last grid point <= x (-1: below table)
+    j = np.count_nonzero(xp <= x[:, None], axis=1) - 1      # last grid point <= x (-1: below the table)
     jc = np.clip(j, 0, m - 2)
     x0 = xp[node, jc]
     x1 = xp[node, jc + 1]
@@ -40,20 +93,97 @@ def _interp_table(x, tab, rows):
     return np.where(np.isnan(x), x, out)
 
 
+class _NodeTable(object):
+    """Lookup tables of all nodes of a channel on one uniform depth grid per node (rows: Qbar, Cbar, Dbar,
+    dDbar/dQbar, top width, area). values() returns the same numbers as _interp_table, but finds the grid interval
+    from h / dh instead of comparing h with the whole grid, and one interval search serves all rows."""
+
+    def __init__(self, grid, values):
+        self.g = np.ascontiguousarray(grid, dtype=float)                      # (N, m)
+        self.v = np.ascontiguousarray(values, dtype=float)                    # (N, R, m)
+        n, m = self.g.shape
+        self.m = m
+        self.node = np.arange(n)
+        self.shared = bool(np.all(self.g == self.g[0]))                      # one grid for all nodes
+        self.g1 = self.g[0].copy()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            self.inv_dh = (m - 1) / (self.g[:, -1] - self.g[:, 0])
+            self.slope = (self.v[:, :, 1:] - self.v[:, :, :-1]) / (self.g[:, None, 1:] - self.g[:, None, :-1])
+            self.ok = bool(np.all(self.g[:, 0] == 0) and np.all(np.isfinite(self.inv_dh)) and
+                           np.allclose(np.diff(self.g, axis=1) * self.inv_dh[:, None], 1, rtol=1e-9, atol=0))
+        if self.shared:
+            self.inv_dh = float(self.inv_dh[0])
+        # rows whose values and slopes are finite everywhere need no NaN fallback
+        self.finite = np.all(np.isfinite(self.v), axis=(0, 2)) & np.all(np.isfinite(self.slope), axis=(0, 2))
+        self._rows = {}
+        if self.ok:                         # the interval search must agree with _interp_table exactly
+            xs = np.concatenate([self.g.T, (self.g[:, 1:] + self.g[:, :-1]).T / 2, self.g.T * (1 + 1e-15),
+                                 self.g.T * (1 - 1e-15), -self.g[:, 1:2].T, 2 * self.g[:, -1:].T])
+            for x in xs:
+                if not np.array_equal(self._interval(x), np.count_nonzero(self.g <= x[:, None], axis=1) - 1):
+                    self.ok = False
+                    break
+
+    def _interval(self, x):
+        """index of the last grid point <= x (-1 below the table)"""
+        jc = (x * self.inv_dh).astype(np.intp)            # = floor for x >= 0 (index() passes finite x only)
+        np.minimum(jc, self.m - 2, out=jc)
+        np.maximum(jc, 0, out=jc)
+        if self.shared:
+            return jc - (self.g1[jc] > x) + (self.g1[jc + 1] <= x)
+        return jc - (self.g[self.node, jc] > x) + (self.g[self.node, jc + 1] <= x)
+
+    def index(self, x):
+        """interval search for the depths x (None for a NaN or infinite depth: _interp_table handles it)"""
+        if not np.isfinite(x).all():
+            return None
+        j = self._interval(x)
+        jmin, jmax = j.min(), j.max()
+        jc = j if (jmin >= 0 and jmax <= self.m - 2) else np.clip(j, 0, self.m - 2)
+        x0 = self.g1[jc] if self.shared else self.g[self.node, jc]
+        return x, j, jc, x0, jmin, jmax
+
+    def values(self, state, rows, x=None):
+        """table values of the given rows at the depths of an index() result"""
+        if state is None:
+            tab = np.concatenate([self.g[:, None, :], self.v], axis=1)
+            return _interp_table(x, tab, np.asarray(rows) + 1)
+        x, j, jc, x0, jmin, jmax = state
+        r = self._rows.get(rows)
+        if r is None:
+            r = self._rows[rows] = (np.asarray(rows)[:, None], bool(self.finite[list(rows)].all()))
+        r, finite = r
+        y0 = self.v[self.node, r, jc]
+        slope = self.slope[self.node, r, jc]
+        out = slope * (x - x0) + y0
+        if not finite:
+            bad = np.isnan(out)
+            if bad.any():                                     # same fallback as numpy
+                x1 = self.g[self.node, jc + 1]
+                y1 = self.v[self.node, r, jc + 1]
+                with np.errstate(invalid='ignore'):
+                    out = np.where(bad, slope * (x - x1) + y1, out)
+                out = np.where(bad & np.isnan(out) & (y0 == y1), y0, out)
+            hit = x0 == x
+            if hit.any():                                     # exactly on a grid point
+                out = np.where(hit, y0, out)
+        if jmin < 0:                                          # below the table
+            out = np.where(j < 0, self.v[self.node, r, 0], out)
+        if jmax >= self.m - 1:                                # at / above the top of the table
+            out = np.where(j >= self.m - 1, self.v[self.node, r, self.m - 1], out)
+        return out
+
+
 def _write_column(path, arr):
-    """Same bytes as np.savetxt(path, arr) for a 1-D float array, without its per-call overhead."""
+    """same bytes as np.savetxt(path, arr) for a 1-D float array"""
     with open(path, 'w') as fh:
         fh.write(''.join(['%.18e\n' % v for v in arr]))
 
 
 class _JunctionSeries(object):
-    """In-memory version of a junction boundary file (rows of [time, value]).
-
-    Junction boundary conditions used to be passed between segments through
-    segment{j}/geo/boundary_Q and boundary_h, which were read and rewritten on every call.
-    The same records are now kept here, with the same update rules, and Network mirrors them to
-    those files at every print step and at the end of solve().
-    """
+    """In-memory record [time, value] of a junction boundary: the inflow of a channel that starts at a junction (sum
+    of the outflows of the channels draining into it) or the downstream depth of a channel that ends at a junction.
+    Network mirrors the records to segment<j>/geo/boundary_Q and boundary_h at every print step."""
     __slots__ = ('t', 'v', '_pos')
 
     def __init__(self):
@@ -65,7 +195,7 @@ class _JunctionSeries(object):
         self.v.append(val)
 
     def add(self, time, val):
-        """value(time) += val, or a new row if the time is not recorded yet (update_junction_Q)."""
+        """value(time) += val, or a new row if the time is not recorded yet"""
         k = self._pos.get(time)
         if k is None:
             self._append(time, val)
@@ -73,7 +203,7 @@ class _JunctionSeries(object):
             self.v[k] = self.v[k] + val
 
     def set(self, time, val):
-        """value(time) = val, or a new row if the time is not recorded yet."""
+        """value(time) = val, or a new row if the time is not recorded yet"""
         k = self._pos.get(time)
         if k is None:
             self._append(time, val)
@@ -81,2250 +211,910 @@ class _JunctionSeries(object):
             self.v[k] = val
 
     def value_at(self, time):
-        """np.interp over the record; an exactly recorded time is returned directly."""
+        """np.interp over the record; an exactly recorded time is returned directly"""
         k = self._pos.get(time)
         if k is not None:
             return self.v[k]
         return np.interp(time, np.asarray(self.t, dtype=float), np.asarray(self.v, dtype=float))
 
-    def trim(self, pS):
-        """same as the old clear_boundaryDocs: drop the last pS rows, keep the latest one."""
+    def trim(self, n):
+        """drop the last n rows but keep the latest one (keeps the record short during long runs)"""
         last_t, last_v = self.t[-1], self.v[-1]
-        self.t = self.t[:-pS] + [last_t]
-        self.v = self.v[:-pS] + [last_v]
+        self.t = self.t[:-n] + [last_t]
+        self.v = self.v[:-n] + [last_v]
         self._pos = {t: k for k, t in enumerate(self.t)}
 
     def as_array(self):
         return np.column_stack([np.asarray(self.t, dtype=float), np.asarray(self.v, dtype=float)])
 
-    def load(self, path):
-        data = np.loadtxt(path, ndmin=2)
-        self.t = list(data[:, 0]) if data.size else []
-        self.v = list(data[:, 1]) if data.size else []
-        self._pos = {t: k for k, t in enumerate(self.t)}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Shape parameter
+# ---------------------------------------------------------------------------------------------------------------------
+def select_shape_coefficients(caseName, candidates=(2, 3, 4, 6, 8, 12, 16, 24, 32, 48), write=True):
+    """Shape parameter coefficient (c = coef * r_av) of every channel of a case, chosen on the channel's own nodes:
+    the candidate with the smallest error of the operators of the scheme, dQ/dx (fx_invF), d2Q/dx2 (fxx_invF, at the
+    interior nodes) and the depth integration of the backward sequence (hsys), on two smooth test profiles over the
+    channel, exp(-3(1 - s)) and sin(2 pi s) + s^2, s = (x - x_0) / L (largest relative errors). Writes
+    <caseName>/shape (read by Network) and returns (coefficients, errors)."""
+    import types
+    segs = sorted((d for d in os.listdir(caseName) if d.startswith('segment')), key=lambda d: int(d[7:]))
+    coefs, table = [], []
+    for sname in segs:
+        x = np.loadtxt(os.path.join(caseName, sname, 'geo', 'nodes'))
+        N, L = len(x), x[-1] - x[0]
+        xi = (x - x[0]) / L
+        tests = ((np.exp(-3 * (1 - xi)), 3 * np.exp(-3 * (1 - xi)) / L, 9 * np.exp(-3 * (1 - xi)) / L ** 2),
+                 (np.sin(2 * np.pi * xi) + xi ** 2, (2 * np.pi * np.cos(2 * np.pi * xi) + 2 * xi) / L,
+                  (2 - 4 * np.pi ** 2 * np.sin(2 * np.pi * xi)) / L ** 2))
+        errs = []
+        for b in candidates:
+            o = types.SimpleNamespace(nodeNo=N, geo={'nodes': x})
+            o.f = np.zeros((N, N + 3))
+            o.fx = np.zeros_like(o.f)
+            o.fxx = np.zeros_like(o.f)
+            SingleChannel.buildMQ(o, b)
+            e = 0.0
+            for F, dF, d2F in tests:
+                e = max(e, np.max(np.abs(o.fx_invF @ F - dF)) / np.max(np.abs(dF)))
+                e = max(e, np.max(np.abs((o.fxx_invF @ F - d2F)[1:-1])) / np.max(np.abs(d2F[1:-1])))
+                R = np.zeros(N + 3)
+                R[:N - 1] = dF[:-1]
+                R[N - 1] = F[-1]
+                e = max(e, np.max(np.abs(o.hsys @ R - F)) / np.max(np.abs(F)))
+            errs.append(e)
+        coefs.append(float(candidates[int(np.argmin(errs))]))
+        table.append(errs)
+    if write:
+        np.savetxt(os.path.join(caseName, 'shape'), np.array(coefs), fmt='%g')
+    return coefs, table
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------------------------------------------------
 class Network(object):
-    def __init__(self, caseName, g=9.81):
+    """A case: one channel, or a dendritic network of channels (segments) joined at junctions.
+
+    Input file (<case>/input, one value under each of six headers): Courant number, basis type (1: MQ, the only
+    one implemented), shape parameter coefficient (used when <case>/shape does not exist), end time (s), print
+    step (number of time steps between written results) and downstream boundary condition at the outlet
+    (0: normal depth from the rating curve, 1: depth from boundary_h).
+    Network file (<case>/network): one row 'upstream downstream' per pair of segments joined at a junction."""
+
+    def __init__(self, caseName):
         self.caseName = caseName
         self.clean_run_directories()
-        self.g = g
-        self.network = np.loadtxt(caseName + '/network', dtype=int)
+        self.network = np.atleast_2d(np.loadtxt(caseName + '/network', dtype=int))   # one row: two channels
 
-        with open(caseName+'/input', "r") as file:
+        with open(caseName + '/input', 'r') as file:
             lines = file.readlines()
-        self.CFL = float(lines[1][:-1])
-        self.RBFtype = int(lines[4][:-1])
-        self.shapeCoef = float(lines[7][:-1])
-        self.time_integrator = 0
-        self.simEndTime = float(lines[10][:-1])
+        self.CFL = float(lines[1].strip())               # Courant number
+        rbf_type = int(lines[4].strip())
+        if rbf_type != 1:
+            raise ValueError(f'{caseName}/input: basis type {rbf_type}; only the MQ basis (1) is implemented')
+        self.shapeCoef = float(lines[7].strip())
+        self.simEndTime = float(lines[10].strip())
+        self.printStep = int(lines[13].strip())
+        self.dsbcSpec = int(lines[16].strip())           # outlet: 0 normal depth, 1 depth from boundary_h
         self.time = 0
-        self.printStep = int(lines[13][:-1])
-        self.dsbcSpec = int(lines[16][:-1])
 
-        file.close()
-
-        self.num_segments = sum(
-            1 for d in os.listdir(caseName) if d.startswith("segment")
-            and os.path.isdir(os.path.join(caseName, d)))
+        self.num_segments = sum(1 for d in os.listdir(caseName)
+                                if d.startswith('segment') and os.path.isdir(os.path.join(caseName, d)))
         self.segments = self.load_segments()
 
+        # calcOrder: segments from upstream to downstream; segUpstreamInfo[i] / segDownstreamInfo[i]: the segments
+        # that drain into segment i / that segment i drains into
         if self.num_segments == 1:
             self.calcOrder = [0]
             self.segUpstreamInfo = defaultdict(list)
             self.segDownstreamInfo = defaultdict(list)
-            self.downStreams = []
-            self.upStreams = []
         else:
-            self.queSegments()
-
-            self.uppermostStreams = np.unique(self.network)
-            self.downermostStream = np.unique(self.network)
-            remove_vals = np.unique(np.atleast_2d(self.network)[:, 1])
-            mask = ~np.isin(self.uppermostStreams, remove_vals)
-            self.downStreams = self.uppermostStreams[~mask]
-            self.uppermostStreams = self.uppermostStreams[mask]
-            remove_vals = np.unique(np.atleast_2d(self.network)[:, 0])
-            mask = ~np.isin(self.downermostStream, remove_vals)
-            self.upStreams = self.downermostStream[~mask]
-            self.downermostStream = self.downermostStream[mask]
-        self.junction_downs = [k for k, v in self.segUpstreamInfo.items() if v]
+            self.order_segments()
 
         self.reset_junctions()
+        self._has_junctions = any(len(self.segDownstreamInfo[i]) > 0 for i in self.calcOrder)
+        if self._has_junctions:
+            for s in self.segments.values():
+                s.prepare_linear()
 
     def clean_run_directories(self):
-        """Remove all time-step directories in 'run', except '0'."""
+        """removes the results of a previous run: all time folders in segment<i>/run except '0'"""
         for segment_dir in os.listdir(self.caseName):
-            segment_path = os.path.join(self.caseName, segment_dir)
-
-            if os.path.isdir(segment_path) and segment_dir.startswith('segment'):
-                run_dir = os.path.join(segment_path, 'run')
-
-                if os.path.isdir(run_dir):
-                    for time_dir in os.listdir(run_dir):
-                        time_dir_path = os.path.join(run_dir, time_dir)
-                        if os.path.isdir(time_dir_path) and time_dir != '0':
-                            shutil.rmtree(time_dir_path)
-
+            run_dir = os.path.join(self.caseName, segment_dir, 'run')
+            if segment_dir.startswith('segment') and os.path.isdir(run_dir):
+                for time_dir in os.listdir(run_dir):
+                    time_dir_path = os.path.join(run_dir, time_dir)
+                    if os.path.isdir(time_dir_path) and time_dir != '0':
+                        shutil.rmtree(time_dir_path)
         print(f"Completed cleaning up the 'run' directories in {self.caseName}.")
 
     def load_segments(self):
-        """Initialize and store SingleChannel objects for each segment."""
-        segments = {}
-        for i in range(self.num_segments):
-            segments[i] = SingleChannel(self.caseName, i, self.RBFtype, self.shapeCoef)
-        return segments
+        """SingleChannel objects of all segments, with c = coef * r_av; coef from <case>/shape (one value per
+        segment, segment order) if the file exists, otherwise the value of the input file for all segments"""
+        coefs = [self.shapeCoef] * self.num_segments
+        shape_file = os.path.join(self.caseName, 'shape')
+        if os.path.exists(shape_file):
+            v = np.atleast_1d(np.loadtxt(shape_file, dtype=float))
+            if len(v) != self.num_segments:
+                raise ValueError(f'{shape_file}: {len(v)} values for {self.num_segments} segments')
+            coefs = [float(x) for x in v]
+        self.shapeCoefs = coefs
+        return {i: SingleChannel(self.caseName, i, coefs[i]) for i in range(self.num_segments)}
 
-    def queSegments(self):
+    def order_segments(self):
+        """calcOrder (topological order, upstream segments first) and the junction connections from the network file"""
         self.segUpstreamInfo = defaultdict(list)
         self.segDownstreamInfo = defaultdict(list)
-        in_degree = defaultdict(int)  # Store number of upstream segments for each node
+        in_degree = defaultdict(int)                     # number of segments draining into each segment
         all_nodes = set()
-
-        # Read network connections (assuming self.network stores tuples of (upstream, downstream))
         for upstream, downstream in self.network:
             self.segUpstreamInfo[downstream].append(upstream)
             self.segDownstreamInfo[upstream].append(downstream)
             in_degree[downstream] += 1
             all_nodes.update([upstream, downstream])
-
-        # Find segments with zero in-degree (no upstream dependencies)
-        zero_in_degree = deque([node for node in all_nodes if in_degree[node] == 0])
-
-        # Process in topological order
-        self.calcOrder = []
-        while zero_in_degree:
-            segment = zero_in_degree.popleft()
-            self.calcOrder.append(segment)
-
+        queue = deque([node for node in all_nodes if in_degree[node] == 0])
+        order = []
+        while queue:
+            segment = queue.popleft()
+            order.append(segment)
             for downstream in self.segDownstreamInfo[segment]:
                 in_degree[downstream] -= 1
                 if in_degree[downstream] == 0:
-                    zero_in_degree.append(downstream)
+                    queue.append(downstream)
+        self.calcOrder = np.array(order)
 
-        # Convert to numpy array
-        self.calcOrder = np.array(self.calcOrder)
-
-    def warmup(self, tol = 1e-4):
-        iter = 0
-        if self.time_integrator == 0:
-            print('Warming up the initial flow depth.')
-            res = np.ones(self.num_segments)
-            # for i in self.calcOrder:
-            #     run_path = self.caseName + '/segment' + str(i) + '/run/'
-            #     self.Q = np.loadtxt(run_path + '0/Q_warmup')
-            #     ''''''
-            #     self.h = np.loadtxt(run_path + '0/h_warmup')
-
-            for j in range(self.num_segments):
-                self.segments[j].h = np.zeros_like(self.segments[j].Q)
-                for i in range(self.segments[j].nodeNo):
-                    self.segments[j].h[i] = np.interp(self.segments[j].Q[i], self.segments[j].bar_params[i][1, :], self.segments[j].bar_params[i][0, :])
-                self.segments[j].h_old[:] = self.segments[j].h[:]
-
-            while True:
-                dt = 1e8
-                for i in range(self.num_segments):
-                    self.segments[i].readLateral(0, dt)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(0)
-                    self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
-                    # self.segments[i].update_params_cappaleare2(self.segDownstreamInfo[i])
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.nanmin(np.abs(dt_arr[:, 0])))
-
-                dt = self.CFL * dt * .1
-
-                iter += 1
-
+    # ---- time integration ------------------------------------------------------------------------------------------
+    def solve(self, theta=0.5):
+        """Runs the case to the end time of the input file (theta: weight of the new time level, 0.5 = Crank-Nicolson).
+        Q and h of every channel are written to segment<i>/run/<time> every printStep steps and at the end."""
+        nsteps = 0
+        if self.time == 0:
+            self.initial_depths()
+        # CPU time of the time loop (process_time: CPU time of this process; perf_counter: wall clock); cpu_out: the
+        # part spent on screen and file output every printStep steps
+        cpu_out = 0.0
+        cpu0, wall0 = process_time(), perf_counter()
+        while self.time < self.simEndTime:
+            self.step(theta)
+            nsteps += 1
+            if nsteps % self.printStep == 0:
+                out0 = process_time()
+                print(f'Time: {self.time:.2f} s')
+                print('            max Q      min Q      max h      min h      max dQ/dx      min dQ/dx')
                 for i in self.calcOrder:
-                    self.segments[i].readLateral(0, dt)
-                    self.segments[i].solveSeg_CN_warmup(dt, self.segDownstreamInfo[i])
-                    for j in self.segDownstreamInfo[i]:
-                        self.set_junctionbc_null(j)
-
-                    """non-iterative, distinct solution for each segment"""
-                for i in self.calcOrder:
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5()
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h_warmup(self.segments[i].h[0], j)
-
-
-                for i in range(self.num_segments):
-                    res[i] = np.max(np.abs((self.segments[i].h_old[:] - self.segments[i].h[:]) / self.segments[i].h[:]) * 100)
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-
-                print(f'Residual (%): {np.max(res):.5f}, Iteration: {iter}')
-                if (np.max(res) < tol and iter>10) or iter>999:
-                    self._flush_junction_files()
-                    for i in range(self.num_segments):
-                        np.savetxt(f"{self.caseName}/segment{i}/run/0/h", self.segments[i].h[:])
-                        # np.savetxt(f"{self.caseName}/segment{i}/run/0/Q", self.segments[i].Q[:])
-                        dummy = np.atleast_2d(np.loadtxt(f'{self.caseName}/segment{i}/geo/boundary_h'))
-                        dummy[0, :] = np.array([[0, self.segments[i].h[-1]]])
-                        np.savetxt(f'{self.caseName}/segment{i}/geo/boundary_h', dummy)
-                        Qini = np.loadtxt(f"{self.caseName}/segment{i}/run/0/Q")
-                        rmse = np.sqrt(np.sum((self.segments[i].Q - Qini) ** 2 / len(Qini)))
-                        print(f'Simulation warmed up in {iter} iterations. Deviation in Q of channel {i}: {rmse:.6f}')
-                    self._reload_boundaries_after_warmup()
-                    break
-
-    def warmup2(self, tol = 1e-2):
-        iter = 0
-        if self.time_integrator == 0:
-            print('Warming up the initial flow depth.')
-            res = np.ones(self.num_segments)
-            # for i in self.calcOrder:
-            #     run_path = self.caseName + '/segment' + str(i) + '/run/'
-            #     self.Q = np.loadtxt(run_path + '0/Q_warmup')
-            #     ''''''
-            #     self.h = np.loadtxt(run_path + '0/h_warmup')
-
-            for j in range(self.num_segments):
-                self.segments[j].h = np.zeros_like(self.segments[j].Q)
-                for i in range(self.segments[j].nodeNo):
-                    self.segments[j].h[i] = np.interp(self.segments[j].Q[i], self.segments[j].bar_params[i][1, :],
-                                                      self.segments[j].bar_params[i][0, :])
-                self.segments[j].h_old[:] = self.segments[j].h[:]
-
-            while True:
-                dt = 1e8
-                jbc = np.zeros(self.num_segments)
-                ddqddx = np.zeros(self.num_segments)
-                for i in range(self.num_segments):
-                    # self.segments[i].readLateral(0)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(0)
-                    self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
-                    # self.segments[i].update_params_cappaleare2(self.segDownstreamInfo[i])
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.nanmin(np.abs(dt_arr[:, 0])))
-
-
-                    # ddqddx[i] = np.matmul(self.segments[i].fxx_invF, self.segments[i].Q)[-1]
-
-                dt = self.CFL * dt * .1
-
-                for i in range(self.num_segments):
-                    dx = self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                    coef = dx - self.segments[i].cele[-2] * dt
-                    jbc[i] = self.segments[i].Q[-2] + coef / (coef + dx - self.segments[i].cele[-2] * dt) * \
-                             (self.segments[i].Q[-1] - self.segments[i].Q[-2])
-                iter += 1
-
-                for i in self.calcOrder:
-                    # self.segments[i].readLateral(0)
-                    self.segments[i].solveSeg_CN(dt, self.segDownstreamInfo[i])
-                    for j in self.segDownstreamInfo[i]:
-                        self.set_junctionbc_null(j)
-
-                    """non-iterative, distinct solution for each segment"""
-                for i in self.calcOrder:
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],
-                                                           self.segments[i].bar_params[-1][1, :],
-                                                           self.segments[i].bar_params[-1][0, :])
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h6(dt)
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h_warmup(self.segments[i].h[0], j)
-
-                for i in range(self.num_segments):
-                    res[i] = np.max(
-                        np.abs((self.segments[i].h_old[:] - self.segments[i].h[:]) / self.segments[i].h[:]) * 100)
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-
-                print(f'Residual (%): {np.max(res):.5f}, Iteration: {iter}')
-                if (np.max(res) < tol and iter > 10) or iter > 999:
-                    self._flush_junction_files()
-                    for i in range(self.num_segments):
-                        np.savetxt(f"{self.caseName}/segment{i}/run/0/h", self.segments[i].h[:])
-                        # np.savetxt(f"{self.caseName}/segment{i}/run/0/Q", self.segments[i].Q[:])
-                        dummy = np.atleast_2d(np.loadtxt(f'{self.caseName}/segment{i}/geo/boundary_h'))
-                        dummy[0, :] = np.array([[0, self.segments[i].h[-1]]])
-                        np.savetxt(f'{self.caseName}/segment{i}/geo/boundary_h', dummy)
-                        Qini = np.loadtxt(f"{self.caseName}/segment{i}/run/0/Q")
-                        rmse = np.sqrt(np.sum((self.segments[i].Q - Qini) ** 2 / len(Qini)))
-                        print(f'Simulation warmed up in {iter} iterations. Deviation in Q of channel {i}: {rmse:.6f}')
-                    self._reload_boundaries_after_warmup()
-                    break
-
-    def solve(self):
-        iter = 0
-        if self.time_integrator == 0:
-            omega = .075
-            dt_old = 0
-            while self.time < self.simEndTime:
-                dt = 1e8
-                new_xi = np.zeros(self.num_segments)
-                for i in range(self.num_segments):
-                    # self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-                    self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
-                    # self.segments[i].update_params_cappaleare2(self.segDownstreamInfo[i])
-
-                    # dt_arr[:, 1] = self.segments[i].h[:] * self.segments[i].geo['dx'][:] / (self.segments[i].lat[:] + 1e-8) * .2
-                    # dt_arr[:, 1] = self.segments[i].area[:] / (self.segments[i].lat[:] + 1e-8) * .2
-                    # dt = min(dt, np.min(np.abs(dt_arr[:, 0])), np.min(np.abs(dt_arr[:, 1])))
-                    dt = min(dt, np.min(np.abs(self.segments[i].geo['dx'][:] / self.segments[i].cele[:])))
-                    # cf = np.max(np.abs(self.segments[i].lat / self.segments[i].latLimiter))
-                    # dt /= max(1, cf)
-
-                    # new_xi[i] = self.segments[i].dQdx[-1]
-
-                dt = self.CFL * dt
-                iter += 1
-                self.time += dt
-
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time, dt)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-                    self.segments[i].solveSeg_CN(dt, self.segDownstreamInfo[i])
-                    # for j in self.segDownstreamInfo[i]:
-                    #     self.set_junctionbc_null(j)
-
-                    """non-iterative, distinct solution for each segment"""
-                # for i in self.calcOrder:
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],self.segments[i].bar_params[-1][1, :], self.segments[i].bar_params[-1][0, :])
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5()
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-                correction_counter = 0
-                res = np.ones(self.num_segments)
-
-                while correction_counter < 1:
-                    correction_counter += 1
-                    for i in self.calcOrder:
-                        for j in self.segDownstreamInfo[i]:
-                            self.set_junctionbc_null(j)
-                        dtA = (self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-                        new_xi[i] = omega * -dtA + (1 - omega) * self.segments[i].dQdx[-1]
-
-                        # self.update_celerity(i, -dtA)
-                    for i in self.calcOrder:
-                        # self.segments[i].readLateral(self.time)
-                        self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                        self.segments[i].solveSeg_CN_sec(dt, self.segDownstreamInfo[i], new_xi[i])
-
-                        """non-iterative, distinct solution for each segment"""
-                        for j in self.segDownstreamInfo[i]:
-                            self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                    for i in self.calcOrder[::-1]:
-                        if i == self.calcOrder[-1] and self.dsbcSpec == 0:
-                            '''rating curve for the most downstream boundary'''
-                            self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                        else:
-                            self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        self.segments[i].solveSeg_h5()
-                        for j in self.segUpstreamInfo[i]:
-                            self.update_junction_h(self.segments[i].h[0], j)
-
-                for i in range(self.num_segments):
-                    # self.segments[i].area_old2 = self.segments[i].area_old[-1]
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].area_old[:] = self.segments[i].area[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time:.2f}")
-                    print(f'------------- Max Q ----- Min Q ------- Max h --- Min h --- Max dQ/dx --------- Min dQ/dx')
-                    for i in self.calcOrder:
-                        print(f'Channel {i+1}:    {max(self.segments[i].Q):.2f}      {min(self.segments[i].Q):.2f}      {max(self.segments[i].h):.2f}    '
-                              f'  {min(self.segments[i].h):.2f}      {max(self.segments[i].dQdx):.6f}      {min(self.segments[i].dQdx):.6f}      {max(self.segments[i].cele):.6f}')
-                        # print(self.segments[i].diffu)
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        _write_column(f"{time_folder}/h", self.segments[i].h[:])
-                        _write_column(f"{time_folder}/Q", self.segments[i].Q[:])
-                        # plt.plot(iter, self.segments[0].dQdx[-1], marker='x', color='k', markersize=3)
-                        # plt.plot(iter, self.segments[1].dQdx[-1], marker='x', color='b', markersize=3)
-                        # plt.plot(iter, self.segments[2].dQdx[0], marker='x', color='r', markersize=3)
-                        # plt.plot(iter, jbc[1], marker='+', color='k', markersize=3)
-                        # plt.plot(iter, self.segments[1].Q[-1], marker='+', color='b', markersize=3)
-                        # plt.plot(iter, jbc[2], marker='+', color='r', markersize=3)
-
-                    self.clear_boundaryDocs(self.printStep)
-                    print(f'----------------------------------------------\n')
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            _write_column(f"{time_folder}/h", self.segments[i].h[:])
-            _write_column(f"{time_folder}/Q", self.segments[i].Q[:])
-            # plt.show()
-            self._flush_junction_files()
-
-    def solve2(self):
-        iter = 0
-        if self.time_integrator == 0:
-            omega = .07
-            dt_old = 0
-
-            while self.time < self.simEndTime:
-                dt = 1e8
-
-                if iter > 0:
-                    pass
-
-                jbc = np.zeros(self.num_segments)
-                for i in range(self.num_segments):
-                    # self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-                    self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
-                    # self.segments[i].update_params_cappaleare2(self.segDownstreamInfo[i])
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    # dt_arr[:, 1] = self.segments[i].h[:] * self.segments[i].geo['dx'][:] / (self.segments[i].lat[:] + 1e-8) * .2
-                    # dt_arr[:, 1] = self.segments[i].area[:] / (self.segments[i].lat[:] + 1e-8) * .2
-                    # dt = min(dt, np.min(np.abs(dt_arr[:, 0])), np.min(np.abs(dt_arr[:, 1])))
-                    dt = min(dt, np.min(np.abs(dt_arr[:, 0])))
-                    # cf = np.max(np.abs(self.segments[i].lat / self.segments[i].latLimiter))
-                    # dt /= max(1, cf)
-
-                for i in range(self.num_segments):
-                    dx = self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2]
-                    coef = dx - self.segments[i].cele[-2] * dt
-                    jbc[i] = self.segments[i].Q[-2] + coef / (coef + dx - self.segments[i].cele[-2] * dt) * \
-                             (self.segments[i].Q[-1] - self.segments[i].Q[-2])
-
-                dt = self.CFL * dt
-                iter += 1
-                self.time += dt
-
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time, dt)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-                    self.segments[i].solveSeg_CN(dt, self.segDownstreamInfo[i])
-                    # for j in self.segDownstreamInfo[i]:
-                    #     self.set_junctionbc_null(j)
-
-                    """non-iterative, distinct solution for each segment"""
-                # for i in self.calcOrder:
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1] and self.dsbcSpec == 0:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],self.segments[i].bar_params[-1][1, :], self.segments[i].bar_params[-1][0, :])
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h6(dt)
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-                for i in range(self.num_segments):
-                    # self.segments[i].area_old2 = self.segments[i].area_old[-1]
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].area_old[:] = self.segments[i].area[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time:.2f}")
-                    print(f'------------- Max Q ----- Min Q ------- Max h --- Min h --- Max dQ/dx --------- Min dQ/dx')
-                    for i in self.calcOrder:
-                        print(f'Channel {i+1}:    {max(self.segments[i].Q):.2f}      {min(self.segments[i].Q):.2f}      {max(self.segments[i].h):.2f}    '
-                              f'  {min(self.segments[i].h):.2f}      {max(self.segments[i].dQdx):.6f}      {min(self.segments[i].dQdx):.6f}      {max(self.segments[i].cele):.6f}')
-                        # print(self.segments[i].diffu)
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-                        # plt.plot(iter, self.segments[0].dQdx[-1], marker='o', color='k')
-                        # plt.plot(iter, self.segments[1].dQdx[-1], marker='o', color='b')
-                        # plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
-                        # plt.plot(iter, self.segments[2].dQdx[0], marker='o', color='r')
-
-                    self.clear_boundaryDocs(self.printStep)
-                    print(f'----------------------------------------------\n')
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            # plt.show()
-
-    def solve_ydk(self):
-        iter = 0
-        if self.time_integrator == 0:
-            # plt.ion()
-            # dd = np.array([])
-            # cc = np.array([])
-            # tmtm = np.array([])
-            while self.time < self.simEndTime:
-                dt = 1e8
-                for i in range(self.num_segments):
-                    # self.segments[i].update_params(self.diffLim)
-                    self.segments[i].update_params_cappaleare(self.segDownstreamInfo[i])
-                    # self.segments[i].update_params_cappaleare2()
-                    # self.segments[i].update_params_cappaleare_yedek()
-                    # self.segments[i].update_params_new()
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.nanmin(np.abs(dt_arr[:, 0])))
-
-                    # A = (self.segments[i].cele[:] * self.segments[i].fx_invF - self.segments[i].diffu[:] * self.segments[i].fxx_invF)
-                    # A = (self.segments[i].cele[:] * self.segments[i].fx_invF)
-                    # B = self.segments[i].diffu[:] * self.segments[i].fxx_invF
-                    # normA = np.sqrt(np.max(np.abs(np.linalg.eigvals(np.matmul(np.transpose(A), A)))))
-                    # normB = np.sqrt(np.max(np.abs(np.linalg.eigvals(np.matmul(np.transpose(B), B)))))
-                    # dt = min(dt, 1 / normA)
-
-                    # dx_l = (self.segments[i].geo['nodes'][-1] - self.segments[i].geo['nodes'][-2])
-                    # normB = np.abs(self.segments[i].cele[-1] / dx_l - self.segments[i].diffu[-1] / dx_l ** 2)
-                    # dt = min(dt, 1 / normA, 1 / normB)
-
-                dt = self.CFL * dt
-                # dt = 20
-
-
-                # print(dt * self.segments[i].cele[0]/ self.segments[i].geo['dx'][1])
-                # self.time += dt
-                iter += 1
-                self.time += dt
-
-                # self.segments[0].Q[0] = self.segments[0].read_upstream_Q(self.time)
-                # self.segments[1].Q[0] = self.segments[1].read_upstream_Q(self.time)
-
-
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time, dt)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time) + getattr(self.segments[i], 'qlat_us', 0.0)
-
-                    # self.downstream_characteristics_plusminus(i, dt)
-                    # self.downstream_characteristics_plus(i, dt)
-                    # self.downstream_characteristics_plus2(i, dt)
-                    # self.downstream_characteristics_minus(i, dt)
-                    # self.downstream_characteristics_minus2(i, dt)
-
-                    # self.segments[i].solveSeg_fwEuler(dt, self.time)
-                    # self.segments[i].solveSeg_fwEuler2(dt, self.time)
-                    # self.segments[i].solveSeg_fwEuler3(dt, self.time)
-                    # self.segments[i].solveSeg_fwEuler4(dt, self.time)
-                    # self.segments[i].solveSeg_fwEuler5(dt, self.time)
-                    # self.segments[i].solveSeg_fwEuler6(dt, self.time)
-                    # self.segments[i].solveSeg_fwEuler7(dt, self.time)
-                    # self.segments[i].solveSeg_bwEuler(dt, self.time)
-                    # self.segments[i].solveSeg_heun(dt, self.time)
-                    self.segments[i].solveSeg_CN_ydk(dt)
-                    # self.segments[i].solveSeg_CN_2(dt, self.time) # simultaneous network
-                    # self.segments[i].solveSeg_CN3(dt, self.time, self.segDownstreamInfo[i], self.vmoc)
-                    # self.segments[i].solveSeg_CN5(dt, self.time, self.segDownstreamInfo[i])
-                    # self.segments[i].solveSeg_RKo2(dt, self.time)
-                    # self.segments[i].solveSeg_RKo4(dt, self.time)
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
-                        '''normal conditions for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    # self.segments[i].solveSeg_h(self.time)
-                    # self.segments[i].solveSeg_h2(self.time)
-                    # self.segments[i].solveSeg_h3(self.time)
-                    # self.segments[i].solveSeg_h_normal()
-                    self.segments[i].solveSeg_h4()
-                    # self.segments[i].solveSeg_h5()
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-
-                for i in range(self.num_segments):
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                # self.time += dt
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time}")
-                    # dd = np.append(dd, self.segments[1].diffu[0])
-                    # cc = np.append(cc, self.segments[1].cele[0])
-                    # peclet = cc / dd * self.segments[1].geo['nodes'][-1]
-                    # tmtm = np.append(tmtm, self.time)
-
-                    # plt.plot(dd/1000)
-                    # plt.plot(cc)
-                    # plt.plot(tmtm, cc / dd * self.segments[1].geo['nodes'][-1])
-                    # plt.show()
-                    # plt.pause(.1)
-                    # plt.cla()
-                    for i in self.calcOrder:
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            # np.savetxt(f'{self.caseName}/segment{1}/peclet', np.transpose(np.array((tmtm, peclet))))
-
-    def solve_capp2step(self):
-        iter = 0
-        if self.time_integrator == 0:
-            while self.time < self.simEndTime:
-                dt = 1e8
-                for i in range(self.num_segments):
-                    self.segments[i].update_params_cappaleare()
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.nanmin(np.abs(dt_arr[:, 0])))
-
-                dt = self.CFL * dt
-                iter += 1
-                self.time += dt
-
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                    self.segments[i].solveSeg_CN_2step_1(dt, self.segments[i].oldQ)
-                    self.segments[i].solveSeg_CN_2step_2(dt, self.segments[i].Q)
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h4()
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-
-                for i in range(self.num_segments):
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time}")
-                    for i in self.calcOrder:
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-
-    def solve_iterative_secant(self):
-        iter = 0
-        if self.time_integrator == 0:
-            while self.time < self.simEndTime:
-                dt = 1e8
-                for i in range(self.num_segments):
-                    self.segments[i].update_params_cappaleare()
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.min(np.abs(dt_arr[:, 0])))
-
-                dt = self.CFL * dt
-                iter += 1
-                self.time += dt
-
-                tet = 4
-                secant_xj_old = -np.ones(self.num_segments) * .5e-7
-                secant_xj = np.zeros(self.num_segments)
-                secant_fj_old = np.zeros(self.num_segments)
-                secant_fj = np.zeros(self.num_segments)
-
-                # for i in self.calcOrder:
-                #     for j in self.segDownstreamInfo[i]:
-                #         self.set_junctionbc_null(j)
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                    self.segments[i].solveSeg_CN7(dt, self.segDownstreamInfo[i], secant_xj_old[i])
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],
-                                                           self.segments[i].bar_params[-1][1, :],
-                                                           self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5(self.time)
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-                    secant_fj_old[i] = tet * secant_xj_old[i] + (1 - tet) * self.segments[i].dQdx[-1] + (self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-
-                for i in self.calcOrder:
-                    for j in self.segDownstreamInfo[i]:
-                        self.set_junctionbc_null(j)
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                    self.segments[i].solveSeg_CN7_sec(self.segDownstreamInfo[i], secant_xj[i])
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],
-                                                           self.segments[i].bar_params[-1][1, :],
-                                                           self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5(self.time)
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-                    secant_fj[i] = tet * secant_xj[i] + (1 - tet) * self.segments[i].dQdx[-1] + (
-                                self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-
-                correction_counter = 0
-                res = np.ones(self.num_segments)
-                dumq = []
-                for n in range(self.num_segments):
-                    dumq.append(np.zeros(self.segments[n].nodeNo))
-                # while correction_counter < 5 and np.max(res) > 1e-8:
-                # while correction_counter < 5:
-                while np.max(res) > 1e-4:
-                    correction_counter += 1
-                    # print(np.max(res))
-                    for i in self.calcOrder:
-                        for j in self.segDownstreamInfo[i]:
-                            self.set_junctionbc_null(j)
-
-                        dummy = secant_xj[i]
-                        secant_xj[i] = secant_xj[i] - 1 * secant_fj[i] * (secant_xj_old[i] - secant_xj[i]) / (secant_fj_old[i] - secant_fj[i])
-                        secant_xj_old[i] = dummy
-
-                    for i in self.calcOrder:
-                        self.segments[i].readLateral(self.time)
-                        self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                        self.segments[i].solveSeg_CN7_sec(self.segDownstreamInfo[i], secant_xj[i])
-
-                        """non-iterative, distinct solution for each segment"""
-                        for j in self.segDownstreamInfo[i]:
-                            self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                    for i in self.calcOrder[::-1]:
-                        if i == self.calcOrder[-1]:
-                            '''rating curve for the most downstream boundary'''
-                            self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                            '''fixed flow depth for the most dwnstream boundary'''
-                            # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        else:
-                            self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        self.segments[i].solveSeg_h5(self.time)
-                        for j in self.segUpstreamInfo[i]:
-                            self.update_junction_h(self.segments[i].h[0], j)
-
-                        dummy = secant_fj[i]
-                        secant_fj[i] = tet * secant_xj[i] + (1 - tet) * self.segments[i].dQdx[-1] + (
-                                self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-                        secant_fj_old[i] = dummy
-
-                        res[i] = np.max(np.abs((dumq[i] - self.segments[i].Q) / self.segments[i].Q))
-                        dumq[i][:] = self.segments[i].Q[:]
-
-                for i in range(self.num_segments):
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].area_old[:] = self.segments[i].area[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time}")
-                    for i in self.calcOrder:
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-
-    def solve_iterative_bisect(self):
-        iter = 0
-        if self.time_integrator == 0:
-            while self.time < self.simEndTime:
-                dt = 1e8
-                for i in range(self.num_segments):
-                    self.segments[i].update_params_cappaleare()
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.min(np.abs(dt_arr[:, 0])))
-
-                dt = self.CFL * dt
-                iter += 1
-                self.time += dt
-
-                tet = .85
-                bisect_a = -np.ones(self.num_segments) * 1e-1
-                bisect_b = np.ones(self.num_segments) * 2e-2
-                bisect_c = np.zeros(self.num_segments)
-                bisect_fa = np.zeros(self.num_segments)
-                bisect_fb = np.zeros(self.num_segments)
-                bisect_fc = np.zeros(self.num_segments)
-
-                # for i in self.calcOrder:
-                #     for j in self.segDownstreamInfo[i]:
-                #         self.set_junctionbc_null(j)
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                    self.segments[i].solveSeg_CN7(dt, self.segDownstreamInfo[i], bisect_a[i])
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],
-                                                           self.segments[i].bar_params[-1][1, :],
-                                                           self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5(self.time)
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-                    bisect_fa[i] = tet * bisect_a[i] + (1 - tet) * self.segments[i].dQdx[-1] + (self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-
-                for i in self.calcOrder:
-                    for j in self.segDownstreamInfo[i]:
-                        self.set_junctionbc_null(j)
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                    self.segments[i].solveSeg_CN7_sec(self.segDownstreamInfo[i], bisect_b[i])
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                for i in self.calcOrder[::-1]:
-                    if i == self.calcOrder[-1]:
-                        '''rating curve for the most downstream boundary'''
-                        self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1],
-                                                           self.segments[i].bar_params[-1][1, :],
-                                                           self.segments[i].bar_params[-1][0, :])
-                        '''fixed flow depth for the most dwnstream boundary'''
-                        # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    else:
-                        self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                    self.segments[i].solveSeg_h5(self.time)
-                    for j in self.segUpstreamInfo[i]:
-                        self.update_junction_h(self.segments[i].h[0], j)
-
-                    bisect_fb[i] = tet * bisect_b[i] + (1 - tet) * self.segments[i].dQdx[-1] + (
-                                self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-
-                correction_counter = 0
-                res = np.ones(self.num_segments)
-                # while correction_counter < 5 and np.max(res) > 1e-8:
-                # while correction_counter < 5:
-                while np.max(np.abs(res)) > 1e-8:
-                    correction_counter += 1
-                    print(np.max(bisect_c))
-                    for i in self.calcOrder:
-                        for j in self.segDownstreamInfo[i]:
-                            self.set_junctionbc_null(j)
-
-                        bisect_c[i] = (bisect_b[i] + bisect_a[i]) / 2
-
-                    for i in self.calcOrder:
-                        self.segments[i].readLateral(self.time)
-                        self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                        self.segments[i].solveSeg_CN7_sec(self.segDownstreamInfo[i], bisect_c[i])
-
-                        """non-iterative, distinct solution for each segment"""
-                        for j in self.segDownstreamInfo[i]:
-                            self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                    for i in self.calcOrder[::-1]:
-                        if i == self.calcOrder[-1]:
-                            '''rating curve for the most downstream boundary'''
-                            self.segments[i].h[-1] = np.interp(self.segments[i].Q[-1] / self.segments[i].COR[-1], self.segments[i].bar_params[-1][1, :],self.segments[i].bar_params[-1][0, :])
-                            '''fixed flow depth for the most dwnstream boundary'''
-                            # self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        else:
-                            self.segments[i].h[-1] = self.segments[i].read_downstream_h(self.time)
-                        self.segments[i].solveSeg_h5(self.time)
-                        for j in self.segUpstreamInfo[i]:
-                            self.update_junction_h(self.segments[i].h[0], j)
-
-
-                        bisect_fc[i] = tet * bisect_c[i] + (1 - tet) * self.segments[i].dQdx[-1] + (
-                                self.segments[i].area[-1] - self.segments[i].area_old[-1]) / dt
-
-                        if bisect_fc[i] * bisect_fa[i] < 0:
-                            bisect_b[i] = bisect_c[i]
-                        else:
-                            bisect_a[i] = bisect_c[i]
-
-                        res[i] = np.abs((bisect_a[i] - bisect_b[i]))/bisect_a[i]
-
-                for i in range(self.num_segments):
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].area_old[:] = self.segments[i].area[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time}")
-                    for i in self.calcOrder:
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-
-    def solve_iterative_juncts_h4(self):
-        iter = 0
-        if self.time_integrator == 0:
-            tet = .7
-            omega = .01
-            while self.time < self.simEndTime:
-                dt = 1e8
-                for i in range(self.num_segments):
-                    self.segments[i].update_params_cappaleare()
-
-                    dt_arr = np.zeros((self.segments[i].cele.shape[0], 2))
-                    dt_arr[:, 0] = self.segments[i].geo['dx'][:] / self.segments[i].cele[:]
-                    dt = min(dt, np.min(np.abs(dt_arr[:, 0])))
-
-                dt = self.CFL * dt
-                iter += 1
-                self.time += dt
-
-                new_xi = np.zeros(self.num_segments)
-                dumxi = np.zeros(self.num_segments)
-
-                for i in self.calcOrder:
-                    self.segments[i].readLateral(self.time)
-                    self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                    self.segments[i].solveSeg_CN7(dt, self.segDownstreamInfo[i], new_xi[i])
-                    self.segments[i].solveSeg_h4()
-
-                    """non-iterative, distinct solution for each segment"""
-                    for j in self.segDownstreamInfo[i]:
-                        self.update_junction_Q(self.segments[i].Q[-1], j)
-
-                    dumxi[i] = new_xi[i]
-                    new_xi[i] = - (1 - tet) / tet * self.segments[i].dQdx[-1] + 1 / dt / tet * (
-                                self.segments[i].area_old[-1] - self.segments[i].area[-1])
-                    new_xi[i] = omega * new_xi[i] + (1 - omega) * dumxi[i]
-
-                correction_counter = 0
-                res = np.ones(self.num_segments)
-
-                while correction_counter < 3:
-                    correction_counter += 1
-                    # print(np.max(new_xi))
-                    for i in self.junction_downs:
-                        self.set_junctionbc_null(i)
-                    for i in self.calcOrder:
-                        self.segments[i].readLateral(self.time)
-                        # self.segments[i].Q[0] = self.segments[i].read_upstream_Q(self.time)
-
-                        self.segments[i].solveSeg_CN7_sec(self.segDownstreamInfo[i], new_xi[i])
-                        self.segments[i].solveSeg_h4()
-
-                        """non-iterative, distinct solution for each segment"""
-                        for j in self.segDownstreamInfo[i]:
-                            self.update_junction_Q(self.segments[i].Q[-1], j)
-
-
-                        dumxi[i] = new_xi[i]
-                        new_xi[i] = - (1 - tet) / tet * self.segments[i].dQdx[-1] + 1 / dt / tet * (
-                                self.segments[i].area_old[-1] - self.segments[i].area[-1])
-                        new_xi[i] = omega * new_xi[i] + (1 - omega) * dumxi[i]
-
-                        res[i] = np.max(np.abs((dumxi[i] - new_xi[i]) / new_xi[i]))
-
-                for i in range(self.num_segments):
-                    self.segments[i].oldQ[:] = self.segments[i].Q[:]
-                    self.segments[i].area_old[:] = self.segments[i].area[:]
-                    self.segments[i].h_old[:] = self.segments[i].h[:]
-                    # self.segments[i].topW_old[:] = self.segments[i].topW[:]
-
-                if iter % self.printStep == 0:
-                    print(f"Time: {self.time}")
-                    for i in self.calcOrder:
-                        time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-                        os.makedirs(time_folder, exist_ok=True)
-                        np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-                        np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-            time_folder = f"{self.caseName}/segment{i}/run/{self.time:.4f}"
-            os.makedirs(time_folder, exist_ok=True)
-            np.savetxt(f"{time_folder}/h", self.segments[i].h[:])
-            np.savetxt(f"{time_folder}/Q", self.segments[i].Q[:])
-
-    # ---- junction exchange (in memory, see _JunctionSeries) ---------------------------------
-    def update_junction_Q(self, Q, segId):
-        '''adds Q to the upstream discharge of segment segId at the current time'''
-        self._jQ[segId].add(self.time, Q)
-
-    def set_junctionbc_null(self, segId):
-        '''this piece of code sets discharge to 0 if same time appears in the record. '''
-        self._jQ[segId].set(self.time, 0.0)
-
-    def update_junction_h(self, h, segId):
-        self._jh[segId].set(self.time, h)
-
-    def update_junction_h_warmup(self, h, segId):
-        self._jh[segId].set(self.time, h)
+                    s = self.segments[i]
+                    print(f'Channel {i + 1}: {max(s.Q):10.2f} {min(s.Q):10.2f} {max(s.h):10.2f} {min(s.h):10.2f} '
+                          f'{max(s.dQdx):14.6f} {min(s.dQdx):14.6f}')
+                    self.write_state(i)
+                self.trim_junction_records(self.printStep)
+                print()
+                cpu_out += process_time() - out0
+        cpu_loop, wall_loop = process_time() - cpu0, perf_counter() - wall0
+        for i in self.calcOrder:
+            self.write_state(i)
+        self._flush_junction_files()
+        self.report_cpu_time(nsteps, cpu_loop, cpu_out, wall_loop)
+
+    def report_cpu_time(self, nsteps, cpu_loop, cpu_out, wall_loop):
+        """prints the CPU time of the time loop (also kept in self.cpu_time)"""
+        nodes = sum(len(self.segments[i].Q) for i in range(self.num_segments))
+        self.cpu_time = dict(case=self.caseName, channels=self.num_segments, nodes=nodes, steps=nsteps,
+                             cpu_loop=cpu_loop, cpu_output=cpu_out, cpu_compute=cpu_loop - cpu_out,
+                             wall_loop=wall_loop)
+        print('================ CPU time of the time loop ================')
+        print(f'case: {self.caseName} | channels: {self.num_segments} | nodes: {nodes} | time steps: {nsteps}')
+        print(f'CPU time, time loop          : {cpu_loop:10.3f} s  ({1e3 * cpu_loop / max(nsteps, 1):.4f} ms/step)')
+        print(f'  of which output (print/write): {cpu_out:8.3f} s')
+        print(f'CPU time, without output     : {cpu_loop - cpu_out:10.3f} s')
+        print(f'wall-clock time, time loop   : {wall_loop:10.3f} s')
+        print('============================================================')
+
+    def initial_depths(self):
+        """replaces the initial depths (run/0/h) by the depths of the initial discharges (momentum equation from the
+        downstream depth, as in the backward sequence); the discharges are not changed"""
+        self._backward_sequence()
+        if self._has_junctions:
+            self._prepare_volume_junction()
+
+    def _time_step(self):
+        """C and D at every node from the current Q and h, and the time step of the whole network"""
+        dt = 1e8
+        for i in range(self.num_segments):
+            seg = self.segments[i]
+            seg.update_celerity_diffusivity()
+            dt = min(dt, np.min(np.abs(seg.geo['dx'][:] / seg.celerity[:])))
+        return self.CFL * dt
+
+    def step(self, theta=0.5):
+        """one time step; returns dt"""
+        if self._has_junctions:
+            return self._step_network(theta)
+        dt = self._time_step()
+        self.time += dt
+        for i in self.calcOrder:                            # forward (discharge) sequence
+            seg = self.segments[i]
+            seg.read_laterals(self.time, dt)
+            seg.Q[0] = seg.read_upstream_Q(self.time)
+            seg.solve_discharge(dt, theta)
+        self._backward_sequence()                           # backward (depth) sequence
+        for i in range(self.num_segments):
+            self.segments[i].oldQ[:] = self.segments[i].Q[:]
+        return dt
+
+    # ---- network: volume-balance junction condition ----------------------------------------------------------------
+    def _prepare_volume_junction(self):
+        ds = self.segDownstreamInfo
+        self._tribs = [i for i in self.calcOrder if len(ds[i]) > 0]       # channels draining into a junction
+        self._tidx = {i: k for k, i in enumerate(self._tribs)}
+        self._carry = {i: 0.0 for i in self._tribs}       # volume residual carried to the next step (m3)
+        self._lat_old = {i: 0.0 for i in self._tribs}
+        self._S = {i: self.segments[i].storage() for i in self._tribs}
+        for s in self.segments.values():
+            s.sensitivities()
+        self.junction_residual = 0.0
+
+    def _outlet_dh(self, seg, dQout):
+        """change of the outlet depth over the step (affine in Q_J): rating curve or prescribed depth"""
+        if self.dsbcSpec == 0:
+            q, hq = seg.bar_params[-1][1, :], seg.bar_params[-1][0, :]
+            Q = seg.Q[-1]
+            eps = max(1e-6, 1e-6 * abs(Q))
+            return (np.interp(Q + eps, q, hq) - np.interp(Q - eps, q, hq)) / (2 * eps) * dQout
+        out = np.zeros_like(dQout)
+        out[0] = seg.read_downstream_h(self.time) - seg.h[-1]
+        return out
+
+    def _step_network(self, theta=0.5):
+        """one time step of a network with the volume-balance junction condition (module docstring); returns dt"""
+        ds, us = self.segDownstreamInfo, self.segUpstreamInfo
+        if not hasattr(self, '_tribs'):
+            self._prepare_volume_junction()
+        dt = self._time_step()
+        self.time += dt
+        tribs, tidx = self._tribs, self._tidx
+        m1 = len(tribs) + 1
+        # forward: Q = Q_a + Q_in u + Q_J w for every channel, its projections on the storage and on the depth at the
+        # upstream end, and the inflow as an affine function of the unknown Q_J (columns 1..m)
+        V, P, Qin, lat = {}, {}, {}, {}
+        for i in self.calcOrder:
+            seg = self.segments[i]
+            seg.read_laterals(self.time, dt)
+            lat[i] = seg.lateral_volume_rate() if seg.laterals else 0.0
+            Vi = seg.cn_operator(dt, theta, len(ds[i]) > 0)
+            V[i] = Vi
+            a = np.zeros(m1)
+            if us[i]:
+                for k in us[i]:
+                    a[1 + tidx[k]] = 1.0
+            else:
+                a[0] = seg.read_upstream_Q(self.time)
+            Qin[i] = a
+            dQa = Vi[:, 0] - seg.Q
+            P[i] = (np.matmul(seg.G2, dQa), np.matmul(seg.G2, Vi[:, 1]), np.matmul(seg.G2, Vi[:, 2]), dQa[-1])
+        # changes of the depth at the upstream end and of the storage (affine in Q_J), from the outlet up
+        h0aff, Saff = {}, {}
+        for i in self.calcOrder[::-1]:
+            seg = self.segments[i]
+            p0, pu, pw, dq_last = P[i]
+            base = np.zeros((2, m1))
+            base[:, 0] = p0
+            base += np.outer(pu, Qin[i])
+            if len(ds[i]) > 0:
+                base[:, 1 + tidx[i]] += pw
+                hd = h0aff[ds[i][0]]
+            else:
+                dQout = dq_last * np.eye(1, m1, 0)[0] + V[i][-1, 1] * Qin[i]
+                hd = self._outlet_dh(seg, dQout)
+            h0aff[i] = base[1] + seg.h0H * hd
+            Saff[i] = base[0] + seg.gH * hd
+        # volume balances of the channels draining into junctions: M Q_J = b
+        m = m1 - 1
+        Mm = np.empty((m, m))
+        b = np.empty(m)
+        for i in tribs:
+            k = tidx[i]
+            seg = self.segments[i]
+            row = Saff[i] / dt - theta * Qin[i]
+            row[1 + k] += theta
+            Mm[k] = row[1:]
+            b[k] = -(row[0] - theta * lat[i] - (1 - theta) * (seg.oldQ[0] - seg.oldQ[-1] + self._lat_old[i])
+                     + self._carry[i] / dt)
+        qa = np.r_[1.0, _solve(Mm, b[:, None])[:, 0]]
+        for i in self.calcOrder:
+            seg = self.segments[i]
+            Vi = V[i]
+            seg.Q = Vi[:, 0] + (Qin[i] @ qa) * Vi[:, 1] + ((qa[1 + tidx[i]] * Vi[:, 2]) if len(ds[i]) > 0 else 0.0)
+            for j in ds[i]:
+                self._jQ[j].set(self.time, seg.Q[-1])
+        self._backward_sequence()
+        # volume residual of the linearization, carried to the next step
+        res = 0.0
+        for i in tribs:
+            seg = self.segments[i]
+            Sn = seg.storage()
+            e = (Sn - self._S[i]) - dt * (theta * (seg.Q[0] - seg.Q[-1] + lat[i])
+                                          + (1 - theta) * (seg.oldQ[0] - seg.oldQ[-1] + self._lat_old[i])) + self._carry[i]
+            self._carry[i] = e
+            self._S[i] = Sn
+            res = max(res, abs(e) / (dt * max(1.0, abs(seg.Q[0]))))
+            self._lat_old[i] = lat[i]
+        self.junction_residual = res
+        for s in self.segments.values():
+            s.sensitivities()
+            s.oldQ[:] = s.Q
+        return dt
+
+    def _backward_sequence(self):
+        """depths from the most downstream channel up: the downstream depth of each channel (rating curve or
+        boundary_h at the outlet, junction depth otherwise), then the depth profile; the depth at the upstream end of
+        the channel is the downstream depth of the channels draining into it"""
+        for i in self.calcOrder[::-1]:
+            seg = self.segments[i]
+            if i == self.calcOrder[-1] and self.dsbcSpec == 0:
+                seg.h[-1] = np.interp(seg.Q[-1], seg.bar_params[-1][1, :], seg.bar_params[-1][0, :])  # normal depth
+            else:
+                seg.h[-1] = seg.read_downstream_h(self.time)
+            seg.solve_depth()
+            for j in self.segUpstreamInfo[i]:
+                self._jh[j].set(self.time, seg.h[0])
+
+    # ---- output and junction records -------------------------------------------------------------------------------
+    def write_state(self, i):
+        time_folder = f'{self.caseName}/segment{i}/run/{self.time:.4f}'
+        os.makedirs(time_folder, exist_ok=True)
+        _write_column(f'{time_folder}/h', self.segments[i].h[:])
+        _write_column(f'{time_folder}/Q', self.segments[i].Q[:])
 
     def reset_junctions(self):
+        """junction records: the inflow of every channel that starts at a junction (_jQ) and the downstream depth of
+        every channel that ends at a junction (_jh), initialized from the initial state"""
         self._jQ, self._jh = {}, {}
         for i in self.calcOrder:
             for j in self.segDownstreamInfo[i]:
                 self._jQ[j] = _JunctionSeries()
             for j in self.segUpstreamInfo[i]:
                 self._jh[j] = _JunctionSeries()
-                self.update_junction_h(self.segments[i].h[-1], j)
+                self._jh[j].set(self.time, self.segments[i].h[-1])
         for i in self.calcOrder:
             for j in self.segDownstreamInfo[i]:
-                self.update_junction_Q(self.segments[i].Q[-1], j)
-        # the segments read their junction boundary values from these records
-        for k, seg in self.segments.items():
+                self._jQ[j].add(self.time, self.segments[i].Q[-1])
+        for k, seg in self.segments.items():          # the segments read their junction boundaries from these records
             seg._upQ_series = self._jQ.get(k)
             seg._dsh_series = self._jh.get(k)
         self._flush_junction_files()
 
     def _flush_junction_files(self):
-        '''mirror the in-memory junction records to segment{j}/geo/boundary_Q and boundary_h'''
+        """mirror the junction records to segment<j>/geo/boundary_Q and boundary_h"""
         for j, s in self._jQ.items():
-            np.savetxt(f"{self.caseName}/segment{j}/geo/boundary_Q", s.as_array())
+            np.savetxt(f'{self.caseName}/segment{j}/geo/boundary_Q', s.as_array())
         for j, s in self._jh.items():
-            np.savetxt(f"{self.caseName}/segment{j}/geo/boundary_h", s.as_array())
+            np.savetxt(f'{self.caseName}/segment{j}/geo/boundary_h', s.as_array())
 
-    def _reload_boundaries_after_warmup(self):
-        '''warmup rewrites the boundary files on disk: bring the in-memory copies in line'''
-        for j, s in self._jQ.items():
-            s.load(f"{self.caseName}/segment{j}/geo/boundary_Q")
-        for j, s in self._jh.items():
-            s.load(f"{self.caseName}/segment{j}/geo/boundary_h")
-        for seg in self.segments.values():
-            seg._h_boundaries = None
-
-    def update_celerity(self, i, dQdx):
-        Qbar = np.interp(self.segments[i].h[-1], self.segments[i].bar_params[-1][0, :], self.segments[i].bar_params[-1][1, :])
-        celebar = np.interp(self.segments[i].h[-1], self.segments[i].bar_params[-1][0, :], self.segments[i].bar_params[-1][2, :])
-        difbar = np.interp(self.segments[i].h[-1], self.segments[i].bar_params[-1][0, :], self.segments[i].bar_params[-1][3, :])
-        self.segments[i].COR[-1] = np.sqrt(1 - 2 * difbar / celebar / self.segments[i].Q[-1] * dQdx)
-        dd_dq = np.interp(self.segments[i].h[-1], self.segments[i].bar_params[-1][0, :], self.segments[i].bar_params[-1][4, :])
-        wp = np.interp(self.segments[i].h[-1], self.segments[i].xsParams[self.segments[i].geo['xsInfo'][-1]][0, :],
-                       self.segments[i].xsParams[self.segments[i].geo['xsInfo'][-1]][2, :])
-        self.segments[i].hydraulic_depth[-1] = self.segments[i].area[-1] / wp
-        self.segments[i].cele[-1] = celebar / 2 * (
-                    self.segments[i].COR[-1] * (1 + Qbar / difbar * dd_dq) + 1 / self.segments[i].COR[-1] * (1 - Qbar / difbar * dd_dq))
-
-    def clear_boundaryDocs(self, pS):
-        for j in self.upStreams:
-            self._jh[j].trim(pS)
-        for j in self.downStreams:
-            self._jQ[j].trim(pS)
+    def trim_junction_records(self, n):
+        for s in self._jh.values():
+            s.trim(n)
+        for s in self._jQ.values():
+            s.trim(n)
         self._flush_junction_files()
 
-class SingleChannel(object):
-    """Radial Basis Function Collocation Method for 1D diffusive wave equation."""
 
-    def __init__(self, caseName, segmentNo, rbf_type, shpC, g=9.81):
+# ---------------------------------------------------------------------------------------------------------------------
+# Single channel
+# ---------------------------------------------------------------------------------------------------------------------
+class SingleChannel(object):
+    """One channel (segment): geometry and tables, RBF collocation operators, discharge and depth solutions."""
+
+    # rows of the uniform-flow tables (bar_params) read in update_celerity_diffusivity: Qbar, Dbar, Cbar, dDbar/dQbar
+    _BAR_ROWS = np.array([1, 3, 2, 4])
+    _QC_ROWS = np.array([1, 2])     # Qbar, Cbar (depth_profile)
+    # rows of the cross-section tables (xsParams): top width; area, top width
+    _TOPW_ROW = np.array([1])
+    _XS_ROWS = np.array([3, 1])
+
+    def __init__(self, caseName, segmentNo, shpC):
         self.caseName = caseName
         self.segmentNo = segmentNo
-        self.g = g
         self._upQ_series = None     # set by Network when the upstream boundary is a junction
         self._dsh_series = None     # set by Network when the downstream boundary is a junction
-        self._h_boundaries = None   # cached boundary_h (external downstream water levels)
+        self._h_boundaries = None   # boundary_h of the outlet, read at the first use
         self.load_geometry()
         self.nodeNo = len(self.geo['nodes'])
         self.xs_param_save()
         self.convey_table_calc()
         self.qbar_cbar_dbar_save()
         self.initialize_conditions()
-        self.RBFtype = rbf_type
         self.shpC = shpC
-        self.compute_RBF_matrix()
+        self.f = np.zeros((self.nodeNo, self.nodeNo + 3))
+        self.fx = np.zeros_like(self.f)
+        self.fxx = np.zeros_like(self.f)
+        self.buildMQ(shpC)
         self._build_fast_tables()
 
-    # rows of bar_params used in update_params_cappaleare: Qbar, D_bar, C_bar, dD_bar/dQbar
-    _BAR_ROWS = np.array([1, 3, 2, 4])
-    # rows of xsParams used in solveSeg_h5: area, top width
-    _XS_ROWS = np.array([3, 1])
-
     def _build_fast_tables(self):
-        '''stacked lookup tables for the vectorised interpolation, and the constant rows of the CN system'''
+        """stacked lookup tables for the vectorized interpolation, and the constant rows of the collocation system"""
         self._bar_tab = np.ascontiguousarray(np.stack(self.bar_params))                                  # (N, 5, 301)
         self._xs_tab = np.ascontiguousarray(np.stack([self.xsParams[k] for k in self.geo['xsInfo']]))    # (N, 4, 301)
-        # moment conditions of the CN system (rows N..N+2) never change: set once here
+        # one table for all lookups of a time step (Qbar, Cbar, Dbar, dDbar/dQbar, top width, area), when the
+        # uniform-flow and cross-section tables of every node share their depth grid
+        self._tab = None
+        if np.array_equal(self._bar_tab[:, 0, :], self._xs_tab[:, 0, :]):
+            t = _NodeTable(self._bar_tab[:, 0, :], np.concatenate([self._bar_tab[:, [1, 2, 3, 4], :],
+                                                                    self._xs_tab[:, [1, 3], :]], axis=1))
+            self._tab = t if t.ok else None
+        self._eye = np.eye(self.nodeNo)
+        self._dQdx_of = None            # the Q array that dQdx was computed from (solve_depth)
+        # rows N..N+2 (moment conditions of the polynomial) and column N of rows 1..N-1 never change
         self.sys[self.nodeNo, :self.nodeNo] = 1
         self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
         self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
+        self.sys[1:self.nodeNo, self.nodeNo] = 1
+        self._x1 = self.geo['nodes'][1:].copy()             # nodes 1..N-1 and their squares
+        self._x1sq = self.geo['nodes'][1:] ** 2
+        self._bw_st = None              # interval search of the last depth profile (reused for area / top width)
+        self._bw_hist = []              # last two depth profiles and their time steps (initial guess of Newton)
+        self._dt_cn = None              # time step of the last discharge solution
 
     def load_geometry(self):
-        """Load geometry-related data for the segment."""
-        self.geom_path = f"{self.caseName}/segment{self.segmentNo}/geo/"
+        self.geom_path = f'{self.caseName}/segment{self.segmentNo}/geo/'
         self.geo = {
             'nodes': np.loadtxt(self.geom_path + 'nodes'),
             'slopes': np.loadtxt(self.geom_path + 'slopes'),
-            'xsInfo': np.loadtxt(self.geom_path + 'xsInfo', dtype=int),
+            'xsInfo': np.loadtxt(self.geom_path + 'xsInfo', dtype=int),       # cross-section number of every node
             'mannings_n': np.loadtxt(self.geom_path + 'mannings_n')
         }
         gdx = np.zeros_like(self.geo['nodes'])
         gdx[:-1] = (self.geo['nodes'][1:] - self.geo['nodes'][:-1])
         gdx[-1] = gdx[-2]
-        # gdx[0], gdx[-1] = (self.geo['nodes'][1] - self.geo['nodes'][0]) / 2, (self.geo['nodes'][-1] - self.geo['nodes'][-2]) / 2
         self.geo.update({'dx': gdx})
 
     def initialize_conditions(self):
-        run_path = self.caseName + '/segment' + str(self.segmentNo) + '/run/'
-        self.Q = np.loadtxt(run_path+'0/Q')
-        ''''''
-        self.h = np.loadtxt(run_path+'0/h')
-        ''''''
-        # self.h = np.zeros_like(self.Q)
-        # for i in range(self.nodeNo):
-        #     self.h[i] = np.interp(self.Q[i], self.bar_params[i][1, :], self.bar_params[i][0, :])
-        # # self.h[-1] = np.interp(0, np.atleast_2d(self.boundary_h)[:, 0], np.atleast_2d(self.boundary_h)[:, 1])
-        # np.savetxt(run_path+'0/h', self.h)
-        ''''''
-        self.lat = np.zeros_like(self.Q)
-        self.area = np.zeros_like(self.Q)
-        self.oldQ = np.zeros_like(self.Q)
-        self.dQdx = np.zeros_like(self.Q)
+        run_path = f'{self.caseName}/segment{self.segmentNo}/run/'
+        self.Q = np.loadtxt(run_path + '0/Q')
+        self.h = np.loadtxt(run_path + '0/h')
         self.Q_boundaries = np.atleast_2d(np.loadtxt(self.geom_path + 'boundary_Q'))
-        self.old_dQdx = np.zeros_like(self.Q)
-        self.area_old = np.zeros_like(self.Q)
-        self.h_old = np.zeros_like(self.Q)
+        self.oldQ = self.Q.copy()
+        self.laterals = self._load_laterals()
+        self.G_new = None               # cumulative lateral flow G at the new and the old time level
+        self.G_old = None
+        self.dQdx = np.zeros_like(self.Q)
+        self.celerity = np.zeros_like(self.Q)
+        self.diffusivity = np.zeros_like(self.Q)
+        self.Gamma = np.zeros_like(self.Q)
+        self.area = np.zeros_like(self.Q)
         self.topW = np.zeros_like(self.Q)
-        self.topW_old = np.zeros_like(self.Q)
-        self.cele = np.zeros_like(self.Q)
-        self.cele_h = np.zeros_like(self.Q)
-        self.diffu = np.zeros_like(self.Q)
-        self.dhdx = np.zeros_like(self.Q)
-        self.COR = np.zeros_like(self.Q)
-        self.latLimiter = np.ones_like(self.Q) * 1e-4
-        self.Sf = np.zeros_like(self.Q)
-        self.sys = np.zeros((self.nodeNo+3, self.nodeNo+3))
-        self.rhs = np.zeros(self.nodeNo+3)
-        self.I = np.eye(self.nodeNo)
-        self.bottom_width = np.zeros_like(self.Q)
-        self.hydraulic_depth = np.zeros_like(self.Q)
         for i in range(self.nodeNo):
-            xs = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(self.geo['xsInfo'][i]))
-            self.bottom_width[i] = xs[0,2] - xs[0,1]
-            self.area[i] = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0,:], self.xsParams[self.geo['xsInfo'][i]][3,:])
-            self.topW[i] = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0,:], self.xsParams[self.geo['xsInfo'][i]][1,:])
-        self.area_old[:] = self.area[:]
-        self.topW_old[:] = self.topW[:]
-        self.h_old[:] = self.h[:]
-        self.oldQ[:] = self.Q[:]
-        self.old_dQdx[:] = self.dQdx[:]
-        self.area_old2 = self.area_old[-1]
+            xs = self.xsParams[self.geo['xsInfo'][i]]
+            self.area[i] = np.interp(self.h[i], xs[0, :], xs[3, :])
+            self.topW[i] = np.interp(self.h[i], xs[0, :], xs[1, :])
+        self.sys = np.zeros((self.nodeNo + 3, self.nodeNo + 3))
+        self.rhs = np.zeros(self.nodeNo + 3)
 
-    def compute_RBF_matrix(self):
-        # self.f = np.zeros((self.nodeNo, self.nodeNo+3), dtype=np.float64)
-        self.f = np.zeros((self.nodeNo, self.nodeNo + 3))
-        self.fx = np.zeros_like(self.f)
-        self.fxx = np.zeros_like(self.f)
-
-        if self.RBFtype == 0:
-            self.buildTPS(self.shpC)
-        elif self.RBFtype == 1:
-            self.buildMQ(self.shpC)
-        elif self.RBFtype == 2:
-            self.buildIMQ(self.shpC)
-
+    # ---- RBF collocation matrices ----------------------------------------------------------------------------------
     def buildMQ(self, shpC):
-        xdif = np.zeros((self.nodeNo, self.nodeNo))
+        """f, fx, fxx: MQ basis sqrt(r^2 + c^2), c = shpC * r_av, and the quadratic polynomial (columns N..N+2) and
+        their first and second derivatives at the nodes"""
+        x = self.geo['nodes']
+        N = self.nodeNo
+        xdif = x[:, None] - x[None, :]
         r_av = 0
-        for i in range(self.nodeNo):
-            for j in range(self.nodeNo):
-                xdif[i, j] = self.geo['nodes'][i] - self.geo['nodes'][j]
-                if i == j + 1:
-                    r_av += np.abs(xdif[i, j]) / self.nodeNo
+        for d in np.abs(np.diff(x)):
+            r_av += d / (N - 1)                             # mean node spacing L / (N - 1)
         r = np.abs(xdif)
         c = shpC * r_av
+        self.f[:N, :N] = np.sqrt(r ** 2 + c ** 2)
+        self.f[:N, N] = 1
+        self.f[:N, N + 1] = x
+        self.f[:N, N + 2] = x ** 2
+        self.fx[:N, :N] = xdif / self.f[:N, :N]
+        self.fx[:N, N + 1] = 1
+        self.fx[:N, N + 2] = 2 * x
+        self.fxx[:N, :N] = 1 / self.f[:N, :N] - xdif ** 2 / self.f[:N, :N] ** 3
+        self.fxx[:N, N + 2] = 2
+        SingleChannel._build_operators(self)
 
-        self.f[:self.nodeNo, :self.nodeNo] = np.sqrt(r[:,:] ** 2 + c ** 2)
-        self.f[:self.nodeNo, self.nodeNo] = 1
-        self.f[:self.nodeNo, self.nodeNo+1] = self.geo['nodes'][:]
-        self.f[:self.nodeNo, self.nodeNo + 2] = self.geo['nodes'][:] ** 2
-        print(f'{np.linalg.cond(self.f):.2e}')
-        self.fx[:self.nodeNo,:self.nodeNo] = xdif[:,:] / self.f[:self.nodeNo,:self.nodeNo]
-        self.fx[:self.nodeNo, self.nodeNo + 1] = 1
-        self.fx[:self.nodeNo, self.nodeNo + 2] = 2 * self.geo['nodes'][:]
-        self.fxx[:self.nodeNo,:self.nodeNo] = 1 / self.f[:self.nodeNo,:self.nodeNo] - xdif[:,:] ** 2 / self.f[:self.nodeNo,:self.nodeNo] ** 3
-        self.fxx[:self.nodeNo, self.nodeNo + 2] = 2
-
-        S = np.zeros((self.nodeNo+3, self.nodeNo+3))
-        S[:self.nodeNo-1,:] = self.fx[:-1,:]
-        S[self.nodeNo-1,:] = self.f[-1,:]
-        S[self.nodeNo, :self.nodeNo] = 1
-        S[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        S[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-        invS = np.linalg.pinv(S)
-        self.hsys = np.matmul(self.f, invS)
-
+    def _build_operators(self):
+        """hsys: depth from its derivative at nodes 0..N-2 and its value at the last node (backward sequence);
+        fx_invF, fxx_invF: first and second derivative of nodal values"""
+        N = self.nodeNo
+        S = np.zeros((N + 3, N + 3))
+        S[:N - 1, :] = self.fx[:-1, :]
+        S[N - 1, :] = self.f[-1, :]
+        S[N, :N] = 1
+        S[N + 1, :N] = self.geo['nodes'][:]
+        S[N + 2, :N] = self.geo['nodes'][:] ** 2
+        self.hsys = np.matmul(self.f, np.linalg.pinv(S))
         self.invF = np.linalg.pinv(self.f)
         self.fx_invF = np.matmul(self.fx, self.invF)
         self.fxx_invF = np.matmul(self.fxx, self.invF)
 
-    def buildIMQ(self, shpC): # 0 for 4 rmin, 1 for .815rav
-        xdif = np.zeros((self.nodeNo, self.nodeNo))
-        r_av=0
-        for i in range(self.nodeNo):
-            for j in range(self.nodeNo):
-                xdif[i, j] = self.geo['nodes'][i] - self.geo['nodes'][j]
-                if i == j + 1:
-                    r_av += np.abs(xdif[i, j]) / self.nodeNo
-        r = np.abs(xdif)
-        c = shpC * r_av
-        self.f[:self.nodeNo, :self.nodeNo] = 1 / np.sqrt(r[:,:] ** 2 + c ** 2)
-        self.fx[:,:self.nodeNo] = - xdif[:,:] * self.f[:,:self.nodeNo]**3
-        self.fxx[:,:self.nodeNo] = 3 * xdif[:,:self.nodeNo]**2 * self.f[:,:self.nodeNo]**5 - self.f[:,:self.nodeNo]**3
+    # ---- lateral flows ---------------------------------------------------------------------------------------------
+    def _load_laterals(self):
+        """point lateral flows of the channel from geo/laterals (csv: names, x, q_file); q_file in geo/lateralDatas
+        holds [time (s), Q_l (m3/s)], negative for an outflow"""
+        laterals = []
+        cfg_path = os.path.join(self.geom_path, 'laterals')
+        if os.path.exists(cfg_path):
+            with open(cfg_path, 'r') as f:
+                for row in csv.DictReader(f):
+                    qfile = row['q_file'].strip()
+                    if not os.path.isabs(qfile):
+                        qfile = os.path.join(self.geom_path, 'lateralDatas', qfile)
+                    laterals.append({'name': row.get('names', 'lat'), 'x': float(row['x']),
+                                     'ts': np.atleast_2d(np.loadtxt(qfile))})
+        return laterals
 
-        self.f[:self.nodeNo, self.nodeNo] = 1
-        self.f[:self.nodeNo, self.nodeNo+1] = self.geo['nodes'][:]
-        self.f[:self.nodeNo, self.nodeNo + 2] = self.geo['nodes'][:] ** 2
-        print(f'{np.linalg.cond(self.f):.2e}')
-        self.fx[:self.nodeNo, self.nodeNo + 1] = 1
-        self.fx[:self.nodeNo, self.nodeNo + 2] = 2 * self.geo['nodes'][:]
-        self.fxx[:self.nodeNo, self.nodeNo + 2] = 2
+    def read_laterals(self, time, dt):
+        """cumulative lateral flow G at the old and the new time level of the step"""
+        if self.laterals:
+            self.G_old = self.lateral_G(time - dt) if self.G_new is None else self.G_new
+            self.G_new = self.lateral_G(time)
 
-        S = np.zeros((self.nodeNo+3, self.nodeNo+3))
-        S[:self.nodeNo-1,:] = self.fx[:-1,:]
-        S[self.nodeNo-1,:] = self.f[-1,:]
-        S[self.nodeNo, :self.nodeNo] = 1
-        S[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        S[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-        invS = np.linalg.pinv(S)
-        self.hsys = np.matmul(self.f, invS)
-
-        self.invF = np.linalg.pinv(self.f)
-        self.fx_invF = np.matmul(self.fx, self.invF)
-        self.fxx_invF = np.matmul(self.fxx, self.invF)
-
-    def buildTPS(self, beta):
-        for i in range(self.nodeNo):
-            for j in range(self.nodeNo):
-                if i != j:
-                    r = np.abs(self.geo['nodes'][i] - self.geo['nodes'][j])
-                    self.f[i,j] = r ** beta * np.log(r)
-                    self.fx[i,j] = (self.geo['nodes'][i] - self.geo['nodes'][j]) * r ** (beta - 2) * (
-                                beta * np.log(r) + 1)
-                    self.fxx[i,j] = r ** (beta - 2) * (beta * np.log(r) + 1) + (
-                            self.geo['nodes'][i] - self.geo['nodes'][j]) ** 2 * r ** (beta - 4) * (
-                                              2 * (beta - 1) + beta * (beta - 2) * np.log(r))
-
-        self.f[:self.nodeNo, self.nodeNo] = 1
-        self.f[:self.nodeNo, self.nodeNo+1] = self.geo['nodes'][:]
-        self.f[:self.nodeNo, self.nodeNo + 2] = self.geo['nodes'][:] ** 2
-        print(f'{np.linalg.cond(self.f):.2e}')
-        self.fx[:self.nodeNo, self.nodeNo + 1] = 1
-        self.fx[:self.nodeNo, self.nodeNo + 2] = 2 * self.geo['nodes'][:]
-
-        self.fxx[:self.nodeNo, self.nodeNo + 2] = 2
-
-        S = np.zeros((self.nodeNo+3, self.nodeNo+3))
-        S[:self.nodeNo-1,:] = self.fx[:-1,:]
-        S[self.nodeNo-1,:] = self.f[-1,:]
-        S[self.nodeNo, :self.nodeNo] = 1
-        S[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        S[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-        invS = np.linalg.pinv(S)
-        self.hsys = np.matmul(self.f, invS)
-
-        self.invF = np.linalg.pinv(self.f)
-        self.fx_invF = np.matmul(self.fx, self.invF)
-        self.fxx_invF = np.matmul(self.fxx, self.invF)
-
-    def readLateral_(self, time):
-        """Populate self.lat with physically localized lateral source/sink per unit length (q [m^3/s/m]).
-
-        The method supports two modes:
-        - *local*: distribute each lateral flow over a short reach around its station using a compact kernel
-        - *upstream_lump*: sum all interior lateral flows and add them to the upstream boundary (Fortran-style)
-
-        Lateral definitions are read once from `{segment}/geo/laterals` if present_baton.
-            name,x,sign,spread_m,kernel,q_file
-        where:
-            x         = station location in the same coordinate as `geo/nodes`
-            spread_m  = physical mixing length to distribute the source (default: local dx)
-            kernel    = 'tri' (default) or 'gauss'
-            q_file    = path to a 2-col file [time, Q (m^3/s)] relative to this segment's `geo/` folder or absolute
-
-        The routine is conservative: sum_i lat[i]*dx[i] equals the sum of the specified lateral discharges at the given time.
-        """
-        # Ensure laterals are loaded
-        if not hasattr(self, 'laterals_loaded'):
-            self.laterals = []
-            cfg_path = os.path.join(self.geom_path, 'laterals')
-            if os.path.exists(cfg_path):
-                with open(cfg_path, 'r') as f:
-                    rdr = csv.DictReader(f)
-                    for row in rdr:
-                        try:
-                            name = row.get('name', 'lat')
-                            x = float(row['x'])
-                            spread_m = float(row.get('spread_m', '0')) if row.get('spread_m', '').strip() != '' else 0.0
-                            kernel = (row.get('kernel', 'tri') or 'tri').strip().lower()
-                            qfile = row['q_file'].strip()
-                            if not os.path.isabs(qfile):
-                                qfile = os.path.join(self.geom_path, 'lateralDatas', qfile)
-                            ts = np.atleast_2d(np.loadtxt(qfile))
-                        except Exception as e:
-                            raise RuntimeError(f"Failed to parse lateral row {row}: {e}")
-                        self.laterals.append(
-                            {'name': name, 'x': x, 'spread_m': spread_m, 'kernel': kernel, 'ts': ts, '_prev_Q': 0.0})
-            self.laterals_mode = os.environ.get('LATERALS_MODE', 'local')  # 'local' or 'upstream_lump'
-            self.laterals_loaded = True
-
-        # Reset source term
-        self.lat[:] = 0.0
-        qlat_us = 0.0
-
-        if not hasattr(self, 'laterals'):  # nothing to do
-            self.qlat_us = 0.0
-            return
-
-        x_nodes = self.geo['nodes'].copy()
-        dx_nodes = self.geo['dx'].copy()
-
-        for L in getattr(self, 'laterals', []):
-            if L is None or 'ts' not in L:
-                continue
-            # timeseries: first column is time in seconds compatible with boundary files; second is Q in m^3/s
-            tarr = L['ts'][:, 0];
-            varr = L['ts'][:, 1]
-            Ql = np.interp(time, tarr, varr)
+    def lateral_G(self, time):
+        """G(x_i, t) = sum_k Q_l,k(t) W_k(x_i) at the nodes (m3/s)"""
+        G = np.zeros(self.nodeNo)
+        for L in self.laterals:
+            Ql = np.interp(time, L['ts'][:, 0], L['ts'][:, 1])
             if abs(Ql) < 1e-12:
                 continue
+            if 'W' not in L:
+                L['W'] = self._lateral_step(L['x'])
+            G += Ql * L['W']
+        return G
 
-            # LOCAL APPLICATION (default)
-            x0 = L['x']
-            # Find a compact support around x0
-            dist = np.abs(x_nodes - x0)
-            idx0 = int(np.argmin(dist))
-            # the span of the lateral flow is increased so that the term
-            # dQ/dx does not increase or decrease too sharply.
-            maxCMS_in = np.max(self.Q[:])
-            maxCMS_lat = np.max(np.abs(varr))
-            spread = float(L.get('spread_m', 0.0))
-            # spread = np.abs(maxCMS_lat / maxCMS_in) * self.geo['nodes'][-1]
-            # spread = float(L.get('spread_m', 0.0)) or float(dx_nodes[idx0])
-            R = max(0.5 * spread, 0.5 * dx_nodes[idx0])
-            # R = 0.5 * dx_nodes[idx0]
-            # mask = dist <= R
-            # if not np.any(mask):
-            #     mask[idx0] = True
-            mask[0], mask[-1] = False, False
-            xs = x_nodes[mask]
-            dxs = dx_nodes[mask]
-            print(np.sum(dxs))
-            if L.get('kernel', 'tri') == 'gauss':
-                sigma = max(R / 2.0, 1e-6)
-                w = np.exp(-0.5 * ((xs - x0) / sigma) ** 2)
+    def _lateral_step(self, x0):
+        """W(x_i) of a point lateral flow at x0: 0 upstream, 1 downstream, 1/2 at a node on x0, 1 at the last node"""
+        x = self.geo['nodes']
+        W = (x > x0).astype(float)
+        W[np.abs(x - x0) <= 1e-9 * (x[-1] - x[0])] = 0.5
+        W[-1] = 1.0
+        return W
+
+    def lateral_volume_rate(self):
+        """lateral flow into the channel over its whole length (m3/s)"""
+        return float(self.G_new[-1] - self.G_new[0]) if self.G_new is not None else 0.0
+
+    # ---- parameters of the discharge equation ----------------------------------------------------------------------
+    def update_celerity_diffusivity(self):
+        """Gamma, C and D at every node from the current Q and h"""
+        if self._dQdx_of is not self.Q:    # otherwise computed from this Q at the end of the previous step
+            self.dQdx = np.matmul(self.fx_invF, self.Q)
+        if self._tab is not None:
+            # interval search of the depth profile of the last backward sequence, while self.h is that profile
+            st = self._bw_st if (self._bw_st is not None and self._bw_st[0] is self.h) else self._tab.index(self.h)
+            Qbar, difbar, celebar, dd_dq = self._tab.values(st, (0, 2, 1, 3), self.h)
+        else:
+            Qbar, difbar, celebar, dd_dq = _interp_table(self.h, self._bar_tab, self._BAR_ROWS)
+        self.Gamma = self.Q / Qbar                     # Q = Qbar(h) Gamma, h from the backward sequence
+        k = Qbar / difbar * dd_dq                      # (Qbar / Dbar) dDbar/dQbar
+        self.celerity[:] = celebar / 2 * (self.Gamma * (1 + k) + 1 / self.Gamma * (1 - k))
+        self.diffusivity[:] = difbar / np.abs(self.Gamma)
+
+    # ---- discharge: theta scheme -----------------------------------------------------------------------------------
+    def _set_system(self, dt, theta):
+        """collocation matrix of the step: row 0 inflow; rows 1..N-1 the diffusive wave equation, the last of them the
+        outflow row dQ/dt + C dQ/dx = 0 (D = 0); rows N..N+2 the moment conditions (constant)"""
+        N = self.nodeNo
+        self.sys[0, :] = self.f[0, :]
+        c1 = self.celerity[1:]
+        d1 = self.diffusivity[1:].copy()
+        d1[-1] = 0.0
+        x1 = self._x1
+        self.sys[1:N, :N] = self.f[1:, :N] + dt * theta * (c1[:, None] * self.fx[1:, :N] - d1[:, None] * self.fxx[1:, :N])
+        self.sys[1:N, N + 1] = x1 + dt * theta * c1
+        self.sys[1:N, N + 2] = 2 * x1 * dt * theta * c1 - 2 * theta * dt * d1 + self._x1sq
+        self._dt_cn = dt
+
+    def solve_discharge(self, dt, theta=0.5):
+        """Q at the new time level: the inflow Q[0] (set before the call), the diffusive wave equation at the
+        interior nodes and the outflow row at the downstream end"""
+        N = self.nodeNo
+        if self.laterals:
+            # P = Q - G: dP/dt + C dP/dx = D d2P/dx2 - dG/dt
+            G0, G1 = self.G_old, self.G_new
+            P = self.oldQ - G0
+            adv = self.celerity * np.matmul(self.fx_invF, P)
+            diff = self.diffusivity * np.matmul(self.fxx_invF, P)
+            dG = G1 - G0
+            self.rhs[0] = self.Q[0] - G1[0]
+            self.rhs[1:N - 1] = P[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) - dG[1:-1]
+            self.rhs[N - 1] = P[-1] + (1 - theta) * dt * ((-adv)[-1]) - dG[-1]
+        else:
+            # dQdx was computed from Q at the end of the previous step, and oldQ is that Q (only Q[0] is new)
+            adv = self.celerity * (self.dQdx if self._dQdx_of is self.Q else np.matmul(self.fx_invF, self.oldQ))
+            diff = self.diffusivity * np.matmul(self.fxx_invF, self.oldQ)
+            self.rhs[0] = self.Q[0]
+            self.rhs[1:N - 1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1])
+            self.rhs[N - 1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
+        self._set_system(dt, theta)
+        # minimum-norm solution with the cutoff of np.linalg.pinv (singular values <= 1e-15 of the largest dropped)
+        u, sv, vt = np.linalg.svd(self.sys)
+        coef = np.matmul(self.rhs, u)
+        cut = 1e-15 * sv[0]
+        if sv[-1] > cut:
+            coef /= sv
+        else:
+            keep = sv > cut
+            coef[keep] /= sv[keep]
+            coef[~keep] = 0
+        self.Q = np.matmul(self.f, np.matmul(coef, vt))
+        if self.laterals:
+            self.Q = self.Q + G1
+
+    # ---- depth: zero-inertia momentum equation ---------------------------------------------------------------------
+    def depth_profile(self, Q, h_start, h_down, tol=1e-9, maxit=50):
+        """Depths from dh/dx = S0 (1 - Gamma |Gamma|), Gamma = Q / Qbar(h), with the depth h_down at the downstream
+        end, on the collocation system hsys:
+               h = hsys [R(h); h_down],   R_i = S0_i (1 - Gamma_i |Gamma_i|),  i = 0 .. N-2.
+        Newton's method (Jacobian I - [hsys[:, :N-1] diag(dR/dh), 0], dQbar/dh the slope of the Qbar table in the
+        current depth interval) with a backtracking line search on the residual, from h_start.
+        Returns (h, Gamma, iterations, largest residual in m)."""
+        N = self.nodeNo
+        S0 = self.geo['slopes'][:-1]
+        Hd = self.hsys[:, :N - 1]
+        base = self.hsys[:, N - 1] * h_down
+        tab = self._tab
+        isfinite = math.isfinite
+
+        def residual(h):
+            st = tab.index(h) if tab is not None else None
+            if st is not None:
+                Qbar, Cbar = tab.values(st, (0,), h)[0], None
             else:
-                # triangular kernel
-                w = (R - np.abs(xs - x0)) / R
-                w[w < 0.0] = 0.0
-            denom = np.sum(w * dxs)
-            if denom <= 0.0:
-                denom = dx_nodes[idx0]
-                w = np.ones(1)
-                m2 = np.zeros_like(mask);
-                m2[idx0] = True
-                mask = m2
-                dxs = np.array([denom])
-            q_per_len = Ql / denom  # ensures sum(lat*dx) = Ql
-            self.lat[mask] += q_per_len * w
+                Qbar, Cbar = _interp_table(h, self._bar_tab, self._QC_ROWS)
+            G = Q / Qbar
+            r = h - (np.matmul(Hd, S0 * (1 - G[:-1] * np.abs(G[:-1]))) + base)
+            nr = float(np.abs(r).max())
+            return r, (nr if isfinite(nr) else np.inf), G, Qbar, Cbar, st
 
-    def readLateral(self, time, dt):
-        """Populate self.lat with physically localized lateral source/sink per unit length (q [m^3/s/m])."""
+        h = np.array(h_start, dtype=float)
+        r, nr, G, Qbar, Cbar, st = residual(h)
+        it = 0
+        while nr > tol and it < maxit:
+            it += 1
+            if st is not None:
+                dQbar = tab.slope[tab.node, 0, st[2]]       # dQbar/dh of the interpolated table
+            else:
+                dQbar = Cbar * _interp_table(h, self._xs_tab, self._TOPW_ROW)[0]
+            J = 2 * S0 * np.abs(G[:-1]) * G[:-1] * dQbar[:-1] / Qbar[:-1]      # dR_i/dh_i
+            jac = self._eye.copy()
+            jac[:, :N - 1] -= Hd * J[None, :]
+            step = np.linalg.solve(jac, -r)
+            lam = 1.0
+            while True:
+                hn = h + lam * step
+                trial = residual(hn)
+                if trial[1] < nr or lam < 1e-8:
+                    break
+                lam *= 0.5
+            h = hn
+            r, nr, G, Qbar, Cbar, st = trial
+        self._bw_st = st
+        return h, G, it, nr
 
-        # Ensure laterals are loaded (unchanged)
-        if not hasattr(self, 'laterals_loaded'):
-            self.laterals = []
-            cfg_path = os.path.join(self.geom_path, 'laterals')
-            if os.path.exists(cfg_path):
-                with open(cfg_path, 'r') as f:
-                    rdr = csv.DictReader(f)
-                    for row in rdr:
-                        try:
-                            name = row.get('names', 'lat')
-                            x = float(row['x'])
-                            qfile = row['q_file'].strip()
-                            if not os.path.isabs(qfile):
-                                qfile = os.path.join(self.geom_path, 'lateralDatas', qfile)
-                            ts = np.atleast_2d(np.loadtxt(qfile))
-                        except Exception as e:
-                            raise RuntimeError(f"Failed to parse lateral row {row}: {e}")
-                        self.laterals.append(
-                            {'name': name, 'x': x,
-                              'ts': ts, '_prev_Q': 0.0
-                            }
-                        )
-            self.laterals_mode = os.environ.get('LATERALS_MODE', 'local')  # 'local' or 'upstream_lump'
-            self.laterals_loaded = True
-
-        # Reset source term
-        self.lat[:] = 0.0
-        qlat_us = 0.0
-
-        if not hasattr(self, 'laterals'):  # nothing to do
-            self.qlat_us = 0.0
-            return
-
-        for L in getattr(self, 'laterals', []):
-            if L is None or 'ts' not in L:
-                continue
-            # timeseries: first column is time in seconds compatible with boundary files; second is Q in m^3/s
-            tarr = L['ts'][:, 0];
-            varr = L['ts'][:, 1]
-            Ql = np.interp(time, tarr, varr)
-            if abs(Ql) < 1e-12:
-                continue
-
-            # the spatial weights do not change in time: computed once, then reused
-            if '_w' not in L:
-                L['_idx0'], L['_w'], L['_denom'] = self._lateral_weights(L)
-
-            if 'diversion' in L['name']:
-                Ql = -self.Q[L['_idx0']]
-
-            q_per_len = Ql / L['_denom']
-
-            self.lat[:] += q_per_len * L['_w'][:]
-
-        # coef = 1e3 # higher
-        # self.lat[:] = np.sign(self.lat[:]) * np.minimum(np.abs(self.lat[:]), self.oldQ[:] / self.cele[:] / dt / coef)
-
-    def _lateral_weights(self, L):
-        '''spatial distribution of one lateral inflow (moved out of readLateral, unchanged)'''
-        x_nodes = self.geo['nodes'].copy()
-        dx_nodes = self.geo['dx'].copy()
-
-        x0 = L['x']
-        dist = np.abs(x_nodes - x0)
-        idx0 = np.argmin(dist)
-
-        sigmaC = 2.5e-2
-
-        L_tot = x_nodes[-1] - x_nodes[0]  # total length of active reach
-        sigma = sigmaC * L_tot  # base width
-
-        # --- NEW: asymmetric sigmas ---
-        skew_factor = 4  # >1 means more spread downstream
-
-        sigma_up = sigma  # upstream width  (x <= x0)
-        sigma_dn = sigma * skew_factor  # downstream width (x > x0)
-
-        z = x_nodes - x0
-        w = np.empty_like(x_nodes)
-
-        # Upstream side (x <= x0): decays quickly
-        w[z <= 0] = np.exp(-0.5 * (z[z <= 0] / sigma_up) ** 2)
-
-        # Downstream side (x > x0): decays slowly → more mass downstream
-        w[z > 0] = np.exp(-0.5 * (z[z > 0] / sigma_dn) ** 2)
-        w[idx0] = 1
-        # if  L['name'] == 'bohemia':
-        #     w[idx0+1] = 1
-
-        # Keep peak at 1 at x0 (or nearest grid point)
-        w /= w.max()
-        w[0], w[-1] = 0, 0
-
-        # Optional: visualize
-        # plt.plot(x_nodes, w)
-        # plt.axvline(x0, ls='--')
-        # plt.show()
-
-        denom = np.sum(w * dx_nodes)
-        return idx0, w, denom
-
-    def update_params(self, diffLim):
-        # dQdx = np.matmul(self.fx_invF, self.Q)
-        # dhdx = np.matmul(self.fx_invF, self.h)
-        for i in range(self.nodeNo):
-            wetPerim, self.area[i], tp = self.interp_wet_area(i)
-            R = self.area[i] / wetPerim
-            self.Sf[i] = self.geo['mannings_n'][i] ** 2 / (self.area[i]* R ** (2 / 3)) ** 2 * self.Q[i] ** 2
-            '''comment out the line above and in the line below to switch wide rectangular channel assumption'''
-            # self.Sf[i] = self.geo['mannings_n'][i] ** 2 / (self.area[i] * self.h[i] ** (2 / 3)) ** 2 * self.Q[i] ** 2
-            '''Litrico celerity'''
-            # self.cele[i] = max(6, 5 * self.Sf[i] ** .3 * self.Q[i] ** .4 / 3 / self.area[i] ** .4 * self.h[i] ** .4 / self.geo['mannings_n'][i] ** .6) if self.h[i] > 0 else 0
-            self.cele[i] = 5 * self.Sf[i] ** .3 * self.Q[i] ** .4 / 3 / self.area[i] ** .4 * self.h[i] ** .4 / self.geo['mannings_n'][i] ** .6 if self.h[i] > 0 else 0
-            '''Gasiorowski celerity'''
-            # self.cele[i] = 5/3 * 1 / self.geo['mannings_n'][i] * R**(2/3) * self.Sf[i]**(.5)
-            self.diffu[i] = min(diffLim, np.abs(self.Q[i]) / tp / 2 / self.Sf[i])
-        self.cele[:] = np.mean(self.cele[:])
-        self.diffu[:] = np.mean(self.diffu[:])
-
-    def update_params_cappaleare(self, dInfo):
+    def solve_depth(self):
+        """depth of the backward sequence from the current downstream depth h[-1], then Gamma, wetted area, top
+        width and dQ/dx"""
+        # initial guess of Newton's method: the last two depth profiles extrapolated linearly in time (saves
+        # iterations; the solution does not depend on it), the current depth otherwise
+        h_start = self.h
+        hist, dt = self._bw_hist, self._dt_cn
+        if dt is not None and len(hist) == 2 and hist[1][1] is not None:
+            (h0, _), (h1, dt1) = hist
+            guess = h1 + (h1 - h0) * (dt / dt1)
+            guess[-1] = self.h[-1]
+            if np.isfinite(guess).all() and guess.min() > 0:
+                h_start = guess
+        self.h, G, self.depth_iterations, self.depth_residual = self.depth_profile(self.Q, h_start, self.h[-1])
+        hist.append((self.h.copy(), dt))
+        if len(hist) > 2:
+            del hist[0]
+        self._dt_cn = None
+        self.Gamma = G
+        if self._bw_st is not None:
+            self.area[:], self.topW[:] = self._tab.values(self._bw_st, (5, 4), self.h)
+        else:
+            self.area[:], self.topW[:] = _interp_table(self.h, self._xs_tab, self._XS_ROWS)
         self.dQdx = np.matmul(self.fx_invF, self.Q)
-        # Qbar, D_bar, C_bar and dD_bar/dQbar at every node in one call (was a per-node np.interp loop)
-        Qbar, difbar, celebar, dd_dq = _interp_table(self.h, self._bar_tab, self._BAR_ROWS)
-        # max(1e-12, celebar) and max(1e-9, |Q|), element-wise (same as Python's max, incl. NaN)
-        cel_lim = np.where(celebar > 1e-12, celebar, 1e-12)
-        absQ = np.abs(self.Q)
-        Q_lim = np.where(absQ > 1e-9, absQ, 1e-9)
-        arg = 1 - 2 * difbar / cel_lim / Q_lim * self.dQdx
-        self.COR = np.sqrt(np.maximum(1e-8, arg))
-        if len(dInfo) == 0:
-            # the last node keeps COR = 1 unless the segment drains into a junction
-            self.COR[-1] = 1.0
-
-        self.cele_h[:] = celebar * self.COR
-        self.cele[:] = celebar / 2 * (self.COR * (1 + Qbar / difbar * dd_dq) + 1 / self.COR * (1 - Qbar / difbar * dd_dq))
-        self.diffu[:] = difbar / self.COR
-
-    def update_params_cappaleare2(self, dInfo):
-        self.dQdx = np.matmul(self.fx_invF, self.Q)
-        self.COR = np.ones_like(self.Q)
-        for i in range(self.nodeNo - 1):
-            Qbar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][1, :])
-            difbar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][3, :])
-            celebar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][2, :])
-            dd_dq = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][4, :])
-            wp = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0, :], self.xsParams[self.geo['xsInfo'][i]][2, :])
-            self.hydraulic_depth[i] = self.area[i] / wp
-
-            self.COR[i] = 1
-
-            self.cele[i] = celebar / 2 * (self.COR[i] * (1 + Qbar / difbar * dd_dq) + 1 / self.COR[i] * (1 - Qbar / difbar * dd_dq))
-            self.diffu[i] = difbar / self.COR[i]
-        Qbar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][1, :])
-        difbar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][3, :])
-        celebar = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][2, :])
-        dd_dq = np.interp(self.h[-1], self.bar_params[-1][0, :], self.bar_params[-1][4, :])
-        wp = np.interp(self.h[-1], self.xsParams[self.geo['xsInfo'][-1]][0, :],
-                       self.xsParams[self.geo['xsInfo'][-1]][2, :])
-        self.hydraulic_depth[-1] = self.area[-1] / wp
-        for i in dInfo:
-            # dumcor = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * self.dQdx[i])
-            # self.COR[i] = dumcor if (np.isnan(dumcor) == False) else self.COR[i]
-            self.COR[-1] = 1
-
-        self.cele[-1] = celebar / 2 * (self.COR[-1] * (1 + Qbar / difbar * dd_dq) + 1 / self.COR[-1] * (1 - Qbar / difbar * dd_dq))
-        self.diffu[-1] = difbar / self.COR[-1]
-
-    def update_params_cappaleare_yedek(self):
-        dQdx = np.matmul(self.fx_invF, self.Q)
-        for i in range(self.nodeNo):
-            wetPerim, self.area[i], tp = self.interp_wet_area(i)
-            R = self.area[i] / wetPerim
-            self.Sf[i] = self.geo['mannings_n'][i] ** 2 / (self.area[i]* R ** (2 / 3)) ** 2 * self.Q[i] ** 2
-
-            Qbar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][1, :])
-            difbar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][3, :])
-            celebar = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][2, :])
-            dd_dq = np.interp(self.h[i], self.bar_params[i][0, :], self.bar_params[i][4, :])
-            COR = np.sqrt(1 - 2 * difbar / celebar / self.Q[i] * dQdx[i])
-            # COR = self.Q[i] / Qbar
-            # COR = 1 if np.isnan(COR) else COR
-            # COR = 1
-
-            self.cele[i] = celebar / 2 * (COR * (1 + Qbar / difbar * dd_dq) + 1 / COR * (1 - Qbar / difbar * dd_dq))
-            self.diffu[i] = difbar / COR
-
-
-        # self.cele[:] = 1
-        # self.diffu[:] = .01
-        # self.cele[:] = np.mean(self.cele[:])
-        # self.diffu[:] = np.mean(self.diffu[:])
-
-    def solveSeg_fwEuler(self, dt, time):
-
-        adv = np.matmul(self.I * (self.cele), self.fx_invF)
-        diff = np.matmul(self.I * self.diffu, self.fxx_invF)
-        lat = self.cele * self.lat
-
-        # self.Q[-1] = self.Q[-2]
-        '''Euler here'''
-        self.Q[1:-1] += dt * (np.matmul((-adv + diff), self.Q)[1:-1] + lat[1:-1])
-        # self.Q[-1] += dt * (np.matmul((-adv), self.Q)[-1] + lat[-1])
-
-
-        # self.Q[-1] = self.Q[-2]
-
-        # qg = np.exp(self.geo['nodes'][-1] + self.geo['dx'][- 1] - time)
-        # self.Q[-1] = qg - self.geo['dx'][- 1] * np.exp(self.geo['nodes'][-1] - time)
-
-        # self.Q[-1] = self.Q[-2] + self.geo['dx'][- 1] * np.exp(self.geo['nodes'][-1] - time)
-
-    def solveSeg_bwEuler(self, dt, time):
-        time += dt
-
-        rhs = np.zeros_like(self.Q)
-        rhs[0] = self.read_upstream_Q(time)
-        rhs[1:-1] = self.Q[1:-1]
-        # rhs[-1] = 0
-        rhs[-1] = self.Q[-1]
-
-        sys = np.zeros((self.nodeNo, self.nodeNo))
-        sys[0,:] = self.f[0,:]
-        sys[1:-1,:] = self.f[1:-1,:] + dt * (np.matmul(np.diag(self.cele), self.fx)[1:-1,:] - np.matmul(np.diag(self.diffu), self.fxx)[1:-1,:])
-        # sys[-1, :] = self.fx[-1,:]
-        sys[-1, :] = self.f[-1,:] + dt * np.matmul(np.diag(self.cele), self.fx)[-1,:]
-
-        invSys = np.linalg.pinv(sys)
-        self.Q = np.matmul(self.f, np.matmul(invSys, rhs))
-
-    def solveSeg_bwEuler2(self, dt, time, dInfo):
-        # time += dt
-
-        self.rhs[0] = self.read_upstream_Q(time)
-        self.rhs[1:-1] = self.oldQ[1:-1]
-        self.rhs[-1] = 0
-
-        self.sys = np.zeros((self.nodeNo, self.nodeNo))
-        self.sys[0,:] = self.f[0,:]
-        self.sys[1:-1,:] = self.f[1:-1,:] + dt * (np.matmul(np.diag(self.cele), self.fx)[1:-1,:] - np.matmul(np.diag(self.diffu), self.fxx)[1:-1,:])
-        self.sys[-1, :] = self.fx[-1,:]
-
-        for i in dInfo:
-            self.rhs[-1] = -.05 * (self.area[-1] - self.area_old[-1]) / dt
-
-        invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(invSys, self.rhs))
-
-    def solveSeg_heun(self, dt, time):
-        adv = np.matmul(np.diag(self.cele), self.fx_invF)
-        diff = np.matmul(np.diag(self.diffu), self.fxx_invF)
-        lat = self.cele * self.lat
-
-        '''Euler here'''
-        oldQ = np.zeros_like(self.Q)
-        oldQ[:] = self.Q[:]
-        self.Q[1:] = oldQ[1:] + dt * (np.matmul((-adv + diff), oldQ)[1:] + lat[1:])
-        self.Q[-1] = self.Q[-2]
-
-        self.solveSeg_h4()
-        self.update_params_cappaleare()
-
-        adv = np.matmul(np.diag(self.cele), self.fx_invF)
-        diff = np.matmul(np.diag(self.diffu), self.fxx_invF)
-
-        self.Q[1:] = oldQ[1:] + dt * (np.matmul((-adv + diff), self.Q)[1:] + lat[1:])
-        self.Q[-1] = self.Q[-2]
-
-        # rhs = np.zeros_like(self.Q)
-        # rhs[0] = self.read_upstream_Q(time + dt)
-        # rhs[1:-1] = dum[1:-1]
-        # rhs[-1] = 0
-        #
-        # sys = np.zeros((self.nodeNo, self.nodeNo))
-        # sys[0,:] = self.f[0,:]
-        # sys[1:-1,:] = self.f[1:-1,:] + dt * (np.matmul(np.diag(self.cele), self.fx)[1:-1,:] - np.matmul(np.diag(self.diffu), self.fxx)[1:-1,:])
-        # sys[-1, :] = self.fx[-1,:]
-        # invSys = np.linalg.pinv(sys)
-        # self.Q = np.matmul(self.f, np.matmul(invSys, rhs))
-
-    def solveSeg_CN_ydk(self, dt, theta = .85):
-        adv = np.matmul(np.diag(self.cele), np.matmul(self.fx_invF, self.oldQ))
-        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.oldQ))
-        lat = self.cele * self.lat
-
-        self.rhs[0] = self.Q[0]
-        self.rhs[1:-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1] + lat[1:-1])
-        # self.rhs[-1] = - (1 - theta) * self.dQdx[-1]
-        self.rhs[-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1] + lat[-1])
-        # coef = (self.oldQ[-1] * 2 / self.area_old[-1] + self.cele[-1]) / 2
-        # coef = self.oldQ[-1] * 2 / self.area_old[-1]
-        # self.rhs[-1] = self.oldQ[-1] - dt * (1 - theta) * coef * self.dQdx[-1]
-
-        carpim_adv = np.matmul(np.diag(self.cele), self.fx)
-        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx)
-        self.sys[0, :] = self.f[0, :]
-        self.sys[1:-1, :] = self.f[1:-1, :] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
-        # self.sys[-1, :] = theta * self.fx[-1, :]
-        self.sys[-1, :] = self.f[-1, :] + dt * theta * (carpim_adv[-1, :])
-        # self.sys[-1, :] = self.f[-1, :] + dt * theta * coef * (self.fx[-1, :])
-
-        self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-    def solveSeg_CN(self, dt, dInfo, theta=.85):
-        # element-wise products replace np.matmul(np.diag(.), .): same numbers, O(N^2) instead of O(N^3)
-        adv = self.cele * np.matmul(self.fx_invF, self.oldQ) # switch with self.dqdx for speed
-        diff = self.diffu * np.matmul(self.fxx_invF, self.oldQ)
-        self.lat = self.cele * self.lat
-
-        self.rhs[0] = self.Q[0]
-        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + dt * self.lat[1:-1]
-        # self.rhs[-1] = self.dQdx[-1]
-        self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
-        # coef = self.oldQ[-1] * 2 / self.area_old[-1]
-        # self.rhs[-1] = self.oldQ[-1] - dt * (1 - theta) * coef * self.dQdx[-1]
-        # self.latLimiter = np.abs((1 - theta) * ((-adv + diff)))
-
-        carpim_adv = self.cele[:, None] * self.fx[:, :self.nodeNo]
-        carpim_diffu = self.diffu[:, None] * self.fxx[:, :self.nodeNo]
-        self.sys[0, :] = self.f[0, :]
-
-        self.sys[1:self.nodeNo-1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
-        self.sys[1:self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][1:self.nodeNo - 1] + dt * theta * self.cele[1:self.nodeNo - 1]
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][1:self.nodeNo - 1] * dt * theta * self.cele[1:self.nodeNo - 1] \
-                                                        - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
-                                                        + self.geo['nodes'][1:self.nodeNo - 1] ** 2
-
-        # self.sys[self.nodeNo-1, :] = self.fx[self.nodeNo-1, :]
-        self.sys[self.nodeNo-1, :self.nodeNo] = self.f[self.nodeNo-1, :self.nodeNo] + dt * theta * (carpim_adv[-1, :])
-        self.sys[self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][-1] + dt * theta * self.cele[-1]
-        self.sys[self.nodeNo - 1, self.nodeNo + 2] =  2 * self.geo['nodes'][-1] * dt * theta * self.cele[-1] \
-                                                        + self.geo['nodes'][-1] ** 2
-
-        # rows nodeNo..nodeNo+2 (moment conditions) are constant: set once in _build_fast_tables()
-
-        if len(dInfo) > 0:
-            # self.rhs[self.nodeNo-1] = 0
-            self.rhs[self.nodeNo-1] = self.dQdx[self.nodeNo-1]
-            self.sys[self.nodeNo-1, :] = self.fx[-1, :]
-
-
-        self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-    def solveSeg_CN_sec(self, dt, dInfo, new_xi, theta = .85):
-        self.rhs[0] = self.Q[0]
-        if len(dInfo) > 0:
-            self.rhs[self.nodeNo-1] = new_xi
-            # self.sys[self.nodeNo-1, :] = self.fx[-1, :]
-        # self.rhs[-1] = -(1 - theta) * self.dQdx[-1] + new_xi
-        # self.sys[-1, :] = theta * self.fx[-1, :]
-
-        # self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-        # self.apply_lateral_split(dt)
-
-    def solveSeg_CN_warmup(self, dt, dInfo, theta=.85):
-        adv = self.cele * np.matmul(self.fx_invF, self.oldQ)
-        diff = self.diffu * np.matmul(self.fxx_invF, self.oldQ)
-        lat = self.cele * self.lat
-
-        self.rhs[0] = self.Q[0]
-        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + dt * self.lat[1:-1]
-        self.rhs[self.nodeNo - 1] = 0
-        # self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
-
-        carpim_adv = self.cele[:, None] * self.fx[:, :self.nodeNo]
-        carpim_diffu = self.diffu[:, None] * self.fxx[:, :self.nodeNo]
-        self.sys[0, :] = self.f[0, :]
-
-        self.sys[1:self.nodeNo-1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
-        self.sys[1:self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][1:self.nodeNo - 1] + dt * theta * self.cele[1:self.nodeNo - 1]
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][1:self.nodeNo - 1] * dt * theta * self.cele[1:self.nodeNo - 1] \
-                                                        - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
-                                                        + self.geo['nodes'][1:self.nodeNo - 1] ** 2
-
-        self.sys[self.nodeNo - 1, :] = self.fx[-1, :]
-
-        # self.sys[self.nodeNo-1, :self.nodeNo] = self.f[self.nodeNo-1, :self.nodeNo] + dt * theta * (carpim_adv[-1, :])
-        # self.sys[self.nodeNo - 1, self.nodeNo] = 1
-        # self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][-1] + dt * theta * self.cele[-1]
-        # self.sys[self.nodeNo - 1, self.nodeNo + 2] =  2 * self.geo['nodes'][-1] * dt * theta * self.cele[-1] \
-        #                                                 + self.geo['nodes'][-1] ** 2
-
-        self.sys[self.nodeNo, :self.nodeNo] = 1
-        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-
-        # for i in dInfo:
-        #     self.rhs[self.nodeNo-1] = 0
-        #     self.sys[self.nodeNo-1, :] = self.fx[-1, :]
-
-        self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-    def solveSeg_CN2(self, dt, dInfo, jbc, theta=.85):
-        adv = np.matmul(np.diag(self.cele), np.matmul(self.fx_invF, self.oldQ)) # switch with self.dqdx for speed
-        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.oldQ))
-        self.lat = self.cele * self.lat
-
-        self.rhs[0] = self.Q[0]
-        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + dt * self.lat[1:-1]
-        # self.rhs[-1] = self.dQdx[-1]
-        self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
-        # coef = self.oldQ[-1] * 2 / self.area_old[-1]
-        # self.rhs[-1] = self.oldQ[-1] - dt * (1 - theta) * coef * self.dQdx[-1]
-        # self.latLimiter = np.abs((1 - theta) * ((-adv + diff)))
-
-        carpim_adv = np.matmul(np.diag(self.cele), self.fx[:,:self.nodeNo])
-        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:,:self.nodeNo])
-        self.sys[0, :] = self.f[0, :]
-
-        self.sys[1:self.nodeNo-1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
-        self.sys[1:self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][1:self.nodeNo - 1] + dt * theta * self.cele[1:self.nodeNo - 1]
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][1:self.nodeNo - 1] * dt * theta * self.cele[1:self.nodeNo - 1] \
-                                                        - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
-                                                        + self.geo['nodes'][1:self.nodeNo - 1] ** 2
-
-        # self.sys[self.nodeNo-1, :] = self.fx[self.nodeNo-1, :]
-
-        self.sys[self.nodeNo-1, :self.nodeNo] = self.f[self.nodeNo-1, :self.nodeNo] + dt * theta * (carpim_adv[-1, :])
-        self.sys[self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][-1] + dt * theta * self.cele[-1]
-        self.sys[self.nodeNo - 1, self.nodeNo + 2] =  2 * self.geo['nodes'][-1] * dt * theta * self.cele[-1] \
-                                                        + self.geo['nodes'][-1] ** 2
-
-        self.sys[self.nodeNo, :self.nodeNo] = 1
-        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-
-        for i in dInfo:
-            self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv + diff)[-1])
-            self.sys[self.nodeNo - 1, :self.nodeNo] = self.f[-1, :self.nodeNo] + dt * theta * (
-                        carpim_adv[-1, :] - carpim_diffu[-1, :])
-            self.sys[self.nodeNo - 1, self.nodeNo] = 1
-            self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][
-                                                           self.nodeNo - 1] + dt * theta * self.cele[
-                                                                                             self.nodeNo - 1]
-            self.sys[self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][
-                                                               self.nodeNo - 1] * dt * theta * self.cele[
-                                                                                                 self.nodeNo - 1] \
-                                                           - 2 * theta * dt * self.diffu[self.nodeNo - 1] \
-                                                           + self.geo['nodes'][self.nodeNo - 1] ** 2
-
-        self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-    def solveSeg_CN_sec2(self, dt, dInfo, convdiff_flux, theta = .85):
-        self.rhs[0] = self.Q[0]
-        for i in dInfo:
-            self.rhs[self.nodeNo-1] = convdiff_flux
-            self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1,:]
-            # self.sys[self.nodeNo-1, :] = theta * self.fx[-1, :]
-        # self.rhs[-1] = -(1 - theta) * self.dQdx[-1] + new_xi
-        # self.sys[-1, :] = theta * self.fx[-1, :]
-
-        # self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-        # self.apply_lateral_split(dt)
-
-    def solveSeg_CN_warmup2(self, dt, dInfo, theta=.85):
-        adv = np.matmul(np.diag(self.cele), np.matmul(self.fx_invF, self.oldQ))
-        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.oldQ))
-        lat = self.cele * self.lat
-
-        self.rhs[0] = self.Q[0]
-        self.rhs[1:self.nodeNo-1] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) + lat[1:-1] * dt
-        self.rhs[self.nodeNo-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
-        # self.rhs[-1] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1] + lat[-1])
-
-        carpim_adv = np.matmul(np.diag(self.cele), self.fx[:,:self.nodeNo])
-        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:,:self.nodeNo])
-        self.sys[0, :] = self.f[0, :]
-
-        self.sys[1:self.nodeNo-1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
-        self.sys[1:self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][1:self.nodeNo - 1] + dt * theta * self.cele[1:self.nodeNo - 1]
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][1:self.nodeNo - 1] * dt * theta * self.cele[1:self.nodeNo - 1] \
-                                                        - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
-                                                        + self.geo['nodes'][1:self.nodeNo - 1] ** 2
-
-        self.sys[self.nodeNo-1, :self.nodeNo] = self.f[self.nodeNo-1, :self.nodeNo] + dt * theta * (carpim_adv[-1, :])
-        self.sys[self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][-1] + dt * theta * self.cele[-1]
-        self.sys[self.nodeNo - 1, self.nodeNo + 2] =  2 * self.geo['nodes'][-1] * dt * theta * self.cele[-1] \
-                                                        + self.geo['nodes'][-1] ** 2
-
-        self.sys[self.nodeNo, :self.nodeNo] = 1
-        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-
-        for i in dInfo:
-            self.rhs[self.nodeNo-1] = jbc
-            self.sys[self.nodeNo-1, :] = self.cele[-1] * self.f[-1, :] - self.diffu[-1] * self.fx[-1,:]
-
-        self.invSys = np.linalg.pinv(self.sys)
-        self.Q = np.matmul(self.f, np.matmul(self.invSys, self.rhs))
-
-    def solveSeg_RKo2(self, dt, time):
-        dummy = np.zeros_like(self.Q)
-        K1 = np.zeros_like(self.Q)
-        K2 = np.zeros_like(self.Q)
-        dummy[:] = self.Q[:]
-
-        '''K1'''
-        adv = np.matmul(self.I * (self.cele), np.matmul(self.fx_invF, self.Q))
-        diff = np.matmul(self.I * self.diffu, np.matmul(self.fxx_invF, self.Q))
-        lat = self.cele * self.lat
-        dumt = time + dt
-        K1[1:-1] = dt * ((-adv[1:-1] + diff[1:-1]) + lat[1:-1])
-        K1[-1] = dt * ((-adv[-1]) + lat[-1])
-        dummy[1:] = self.Q[1:] + K1[1:]
-        dummy[0] = self.read_upstream_Q(dumt)
-
-
-        """K2"""
-        adv = np.matmul(self.I * (self.cele), np.matmul(self.fx_invF, dummy))
-        diff = np.matmul(self.I * self.diffu, np.matmul(self.fxx_invF, dummy))
-        lat = self.cele * self.lat
-        K2[1:-1] = dt * ((-adv[1:-1] + diff[1:-1]) + lat[1:-1])
-        K2[-1] = dt * ((-adv[-1]) + lat[-1])
-
-        self.Q[1:] += 1 / 2 * (K1[1:] + K2[1:])
-        self.Q[0] = dummy[0]
-
-    def solveSeg_RKo4(self, dt, time):
-        dummy = np.zeros_like(self.Q)
-        K1 = np.zeros_like(self.Q)
-        K2 = np.zeros_like(self.Q)
-        K3 = np.zeros_like(self.Q)
-        K4 = np.zeros_like(self.Q)
-        dummy[:] = self.Q[:]
-
-        '''K1'''
-        adv = np.matmul(self.I * (self.cele), self.fx_invF)
-        diff = np.matmul(self.I * self.diffu, self.fxx_invF)
-        lat = self.cele * self.lat
-        dumt = time + dt / 2
-        K1[1:] = dt * (np.matmul((-adv + diff), self.Q)[1:] + lat[1:])
-        dummy[1:] = self.Q[1:] + K1[1:] / 2
-        dummy[0] = self.read_upstream_Q(dumt)
-        # qg = np.exp(self.geo['nodes'][-1] + self.geo['dx'][- 1] - dumt)
-
-
-        """K2"""
-        adv = np.matmul(self.I * (self.cele), self.fx_invF)
-        diff = np.matmul(self.I * self.diffu, self.fxx_invF)
-        lat = self.cele * self.lat
-        dumt = time + dt / 2
-        K2[1:] = dt * (np.matmul((-adv + diff), dummy)[1:] + lat[1:])
-        dummy[1:] = self.Q[1:] + K2[1:] / 2
-        # dummy[0] = self.read_upstream_Q(dumt)
-        # qg = np.exp(self.geo['nodes'][-1] + self.geo['dx'][- 1] - dumt)
-        # dummy[-1] = qg - self.geo['dx'][- 1] * np.exp(self.geo['nodes'][-1] - dumt)
-
-        """K3"""
-        adv = np.matmul(self.I * (self.cele), self.fx_invF)
-        diff = np.matmul(self.I * self.diffu, self.fxx_invF)
-        lat = self.cele * self.lat
-        dumt = time + dt
-        K3[1:] = dt * (np.matmul((-adv + diff), dummy)[1:] + lat[1:])
-        dummy[1:] = self.Q[1:] + K3[1:]
-        dummy[0] = self.read_upstream_Q(dumt)
-        # qg = np.exp(self.geo['nodes'][-1] + self.geo['dx'][- 1] - dumt)
-
-        """K4"""
-        adv = np.matmul(self.I * (self.cele), self.fx_invF)
-        diff = np.matmul(self.I * self.diffu, self.fxx_invF)
-        lat = self.cele * self.lat
-        K4[1:] = dt * (np.matmul((-adv + diff), dummy)[1:] + lat[1:])
-
-        self.Q[1:] += 1 / 6 * (K1[1:] + 2 * K2[1:] + 2 * K3[1:] + K4[1:])
-        self.Q[0] = dummy[0]
-
-    def unit_test_fx_derivative(self):
-        # build a linear Q(x) = a*x + b on the collocation nodes
-        # you must have self.x or be able to construct coordinates (use node index if needed)
-        try:
-            x = np.array(self.x)  # prefer actual x coordinates if stored
-        except Exception:
-            # fallback: assume uniform nodes on [0, L]
-            L = getattr(self, 'length', float(self.nodeNo - 1))
-            x = np.linspace(0.0, L, self.nodeNo)
-
-        a = 2.34789
-        b = -0.1234
-        Q_lin = a * x + b
-
-        # derivative estimated by fx row
-        slope_fx = float(np.dot(self.fx[-1, :], Q_lin))
-
-        # FD slope (reference): use central diff on nodes near downstream
-        # approximate slope using last two node values (simple)
-        slope_fd = (Q_lin[-1] - Q_lin[-2]) / (x[-1] - x[-2])
-
-        print(f"[FX TEST] analytic slope a={a:.6e}")
-        print(f"[FX TEST] fx-row estimate  = {slope_fx:.6e}")
-        print(f"[FX TEST] simple FD slope = {slope_fd:.6e}")
-        print(f"[FX TEST] fx - FD = {slope_fx - slope_fd:.6e}")
-        return slope_fx, slope_fd
-
-    def solveSeg_h(self, time):
-        '''Calculate new h'''
-        RHS = self.dhdx
-        RHS[-1] = self.h[-1]
-
-        self.h[:-1] = np.matmul(self.hsys[:-1,:], RHS)
-        if np.any(self.h < 0):
-            for i in range(self.nodeNo - 1):
-                self.h[i] = np.interp(self.Q[i], self.bar_params[i][1, :], self.bar_params[i][0, :])
-            print('Depths are adjusted with normal depth. Time: ', time)
-
-    def solveSeg_h4(self):
-        '''Calculate new h'''
-        for i in range(self.nodeNo):
-            self.h[i] = np.interp(self.Q[i] / self.COR[i], self.bar_params[i][1, :], self.bar_params[i][0, :])
-            self.area[i] = np.interp(self.h[i], self.xsParams[self.geo['xsInfo'][i]][0, :],
-                                 self.xsParams[self.geo['xsInfo'][i]][3, :])
-
-    def solveSeg_h5(self):
-        '''Calculate new h'''
-        RHS = np.zeros(self.nodeNo+3)
-        RHS[:self.nodeNo-1] = self.geo['slopes'][:-1] * (1 - self.COR[:-1] ** 2)
-        RHS[self.nodeNo-1] = self.h[-1]
-        self.h = np.matmul(self.hsys, RHS)
-        # wetted area and top width at every node in one call (was a per-node np.interp loop)
-        self.area[:], self.topW[:] = _interp_table(self.h, self._xs_tab, self._XS_ROWS)
-        # self.dhdx = np.matmul(self.fx_invF, self.h)
-        # self.d2hdx2 = np.matmul(self.fxx_invF, self.h)
-
-    def solveSeg_h6(self, dt, theta = 0.85):
-        '''Calculate new h'''
-        adv = np.matmul(np.diag(self.cele_h), np.matmul(self.fx_invF, self.h_old))  # switch with self.dqdx for speed
-        diff = np.matmul(np.diag(self.diffu), np.matmul(self.fxx_invF, self.h_old))
-        self.lat = self.cele_h * self.lat
-
-        self.rhs[0] = self.geo['slopes'][0] * (1 - self.COR[0] ** 2)
-        # self.rhs[0] = self.h_old[0] + (1 - theta) * dt * ((-adv + diff)[0])
-        # self.rhs[1:self.nodeNo - 1] = self.h_old[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) # + dt * self.lat[1:-1]
-        # self.rhs[self.nodeNo - 1] = self.h[-1]
-
-        carpim_adv = np.matmul(np.diag(self.cele_h), self.fx[:, :self.nodeNo])
-        carpim_diffu = np.matmul(np.diag(self.diffu), self.fxx[:, :self.nodeNo])
-
-        self.sys[0, :] = self.fx[0, :]
-        # self.sys[0, :] = self.f[0, :]
-        # self.sys[0, :self.nodeNo] = self.f[0, :self.nodeNo] + dt * theta * (
-        #             carpim_adv[0, :])
-        # self.sys[0, self.nodeNo] = 1
-        # self.sys[0, self.nodeNo + 1] = self.geo['nodes'][0] + dt * theta * self.cele_h[0]
-        # self.sys[0, self.nodeNo + 2] = 2 * self.geo['nodes'][0] * dt * theta * self.cele_h[0] \
-        #                                                 + self.geo['nodes'][0] ** 2
-
-        self.sys[1:self.nodeNo - 1, :self.nodeNo] = self.f[1:-1, :self.nodeNo] + dt * theta * (
-                    carpim_adv[1:-1, :] - carpim_diffu[1:-1, :])
-        self.sys[1:self.nodeNo - 1, self.nodeNo] = 1
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 1] = self.geo['nodes'][1:self.nodeNo - 1] + dt * theta * self.cele_h[
-                                                                                                           1:self.nodeNo - 1]
-        self.sys[1:self.nodeNo - 1, self.nodeNo + 2] = 2 * self.geo['nodes'][
-                                                           1:self.nodeNo - 1] * dt * theta * self.cele_h[
-                                                                                             1:self.nodeNo - 1] \
-                                                       - 2 * theta * dt * self.diffu[1:self.nodeNo - 1] \
-                                                       + self.geo['nodes'][1:self.nodeNo - 1] ** 2
-
-        self.sys[self.nodeNo - 1, :] = self.f[-1, :]
-
-        self.sys[self.nodeNo, :self.nodeNo] = 1
-        self.sys[self.nodeNo + 1, :self.nodeNo] = self.geo['nodes'][:]
-        self.sys[self.nodeNo + 2, :self.nodeNo] = self.geo['nodes'][:] ** 2
-
-        self.invSysH = np.linalg.pinv(self.sys)
-        self.h = np.matmul(self.f, np.matmul(self.invSysH, self.rhs))
-
-    def interp_wet_area(self, i):
-        h = self.h[i]
-        xsNo = self.geo['xsInfo'][i]
-
-        # Interpolate water surface points
-        tp = np.interp(h, self.xsParams[xsNo][0,:], self.xsParams[xsNo][1,:])
-        wp = np.interp(h, self.xsParams[xsNo][0,:], self.xsParams[xsNo][2,:])
-        area = np.interp(h, self.xsParams[xsNo][0,:], self.xsParams[xsNo][3,:])
-
-        return wp, area, tp
+        self._dQdx_of = self.Q
+
+    # ---- volume-balance junction (Network._step_network) -----------------------------------------------------------
+    def prepare_linear(self):
+        """constant arrays of the volume-balance junction condition"""
+        N = self.nodeNo
+        x = self.geo['nodes']
+        w = np.zeros(N)
+        w[:-1] += (x[1:] - x[:-1]) / 2
+        w[1:] += (x[1:] - x[:-1]) / 2
+        self._trap_w = w                                    # trapezoid weights of the storage integral
+        self._S0m = self.geo['slopes'][:-1].copy()
+        self._Hd = np.ascontiguousarray(self.hsys[:, :N - 1])
+        self._HdT = np.ascontiguousarray(self._Hd.T)
+        self._hdcol = self.hsys[:, N - 1].copy()
+        self._rhs2 = np.zeros((N, 2))
+        self._rhs2[0, 1] = 1.0
+        self._R3 = np.zeros((N + 3, 3))
+        self._R3[0, 1] = 1.0
+        self.G2 = np.zeros((2, N))
+
+    def storage(self):
+        """channel storage, integral of the wetted area (trapezoid over the nodes)"""
+        return float(self._trap_w @ self.area)
+
+    def cn_operator(self, dt, theta, junction_end):
+        """Collocation system of the step (rows as in solve_discharge; at a junction the last row is Q = Q_J),
+        decomposed once. Returns V (N x 3): Q_a (zero inflow, zero Q_J), the unit response to the inflow u and the
+        unit response to Q_J w (zero if the channel does not end at a junction)."""
+        N = self.nodeNo
+        R = self._R3
+        if self.laterals:
+            G0, G1 = self.G_old, self.G_new
+            Pold = self.oldQ - G0
+            dG = G1 - G0
+            adv = self.celerity * np.matmul(self.fx_invF, Pold)
+            diff = self.diffusivity * np.matmul(self.fxx_invF, Pold)
+            R[0, 0] = -G1[0]
+            R[1:N - 1, 0] = Pold[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1]) - dG[1:-1]
+        else:
+            adv = self.celerity * (self.dQdx if self._dQdx_of is self.Q else np.matmul(self.fx_invF, self.oldQ))
+            diff = self.diffusivity * np.matmul(self.fxx_invF, self.oldQ)
+            R[0, 0] = 0.0
+            R[1:N - 1, 0] = self.oldQ[1:-1] + (1 - theta) * dt * ((-adv + diff)[1:-1])
+        self._set_system(dt, theta)
+        sysm = self.sys
+        if junction_end:
+            row = sysm[N - 1].copy()
+            sysm[N - 1, :] = self.f[N - 1, :]
+            R[N - 1, 0] = -G1[-1] if self.laterals else 0.0
+            R[N - 1, 2] = 1.0
+        else:
+            if self.laterals:
+                R[N - 1, 0] = Pold[-1] + (1 - theta) * dt * ((-adv)[-1]) - dG[-1]
+            else:
+                R[N - 1, 0] = self.oldQ[-1] + (1 - theta) * dt * ((-adv)[-1])
+            R[N - 1, 2] = 0.0
+        u, sv, vt = np.linalg.svd(sysm)
+        if junction_end:
+            sysm[N - 1] = row                   # restore the shared matrix
+        keep = sv > 1e-15 * sv[0]
+        inv = np.where(keep, 1.0 / np.where(keep, sv, 1.0), 0.0)
+        V = np.matmul(self.f, np.matmul(vt.T, inv[:, None] * np.matmul(u.T, R)))
+        if self.laterals:
+            V[:, 0] += G1                       # Q = P + G
+        return V
+
+    def sensitivities(self):
+        """Linearization of the depth profile at the current state with the Jacobian of the depth system
+        (depth_profile): dh = jac^-1 (H_d diag(dR/dQ) dQ + hsys[:, N-1] dh_down). Gives
+        dS = G2[0] . dQ + gH dh_down and dh_0 = G2[1] . dQ + h0H dh_down."""
+        N = self.nodeNo
+        S0, Hd = self._S0m, self._Hd
+        tab = self._tab
+        st = self._bw_st if self._bw_st is not None else tab.index(self.h)
+        jc = st[2]
+        Qbar = tab.values(st, (0,), self.h)[0][:-1]
+        dQbar = tab.slope[tab.node, 0, jc][:-1]
+        dA = tab.slope[tab.node, 5, jc]                     # dA/dh of the area table (top width)
+        G = self.Q[:-1] / Qbar
+        aG = np.abs(G)
+        jac = self._eye.copy()
+        jac[:, :N - 1] -= Hd * (2 * S0 * aG * G * dQbar / Qbar)
+        rhs = self._rhs2
+        rhs[:, 0] = self._trap_w * dA
+        z = _solve(jac.T, rhs)
+        dRdQ = -2 * S0 * aG / Qbar
+        self.G2[:, :-1] = (np.matmul(self._HdT, z) * dRdQ[:, None]).T
+        gh = self._hdcol @ z
+        self.gH = float(gh[0])
+        self.h0H = float(gh[1])
+
+    # ---- cross-section and uniform-flow tables ---------------------------------------------------------------------
+    def _read_xs(self, xs_id):
+        """cross-section xs<k>: rows (height above the bed, left bank x, right bank x)"""
+        return np.loadtxt(f'{self.caseName}/segment{self.segmentNo}/geo/xSecs/xs{xs_id}')
 
     def xs_param_save(self):
+        """xsParams[k]: rows (depth grid, top width, wetted perimeter, area) of cross-section k"""
         unique_xs = sorted(set(self.geo['xsInfo']))
         self.xsParams = [None] * len(unique_xs)
-        NN = 300
-
         for xs_id in unique_xs:
-            xs = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(xs_id))
+            xs = self._read_xs(xs_id)
             max_h = xs[-1][0]
-            heyc = np.linspace(0, max_h, NN+1)
-            hdif = max_h / NN
-
+            heyc = np.linspace(0, max_h, N_TABLE + 1)
+            hdif = max_h / N_TABLE
             x1_interp = np.interp(0, xs[:, 0], xs[:, 1])
             x2_interp = np.interp(0, xs[:, 0], xs[:, 2])
-
             area = np.zeros(len(heyc))
             wp = np.zeros(len(heyc))
             tp = np.zeros(len(heyc))
-
             wp[0] = x2_interp - x1_interp
             tp[0] = wp[0]
             for i in range(1, len(heyc)):
-
-                # Interpolate water surface points
-
-                x1_interp_n = np.interp(heyc[i], xs[:, 0], xs[:, 1])
+                x1_interp_n = np.interp(heyc[i], xs[:, 0], xs[:, 1])       # banks at the water surface
                 x2_interp_n = np.interp(heyc[i], xs[:, 0], xs[:, 2])
-
                 tp[i] = x2_interp_n - x1_interp_n
                 wp[i] = wp[i - 1] + np.sqrt((x1_interp_n - x1_interp) ** 2 + hdif ** 2) \
-                        + np.sqrt((x2_interp_n - x2_interp) ** 2 + hdif ** 2)
+                    + np.sqrt((x2_interp_n - x2_interp) ** 2 + hdif ** 2)
                 area[i] = area[i - 1] + tp[i - 1] * hdif \
-                        + np.abs(x1_interp_n - x1_interp) * hdif / 2 \
-                        + np.abs(x2_interp_n - x2_interp) * hdif / 2
-
+                    + np.abs(x1_interp_n - x1_interp) * hdif / 2 \
+                    + np.abs(x2_interp_n - x2_interp) * hdif / 2
                 x1_interp = x1_interp_n
                 x2_interp = x2_interp_n
-
             self.xsParams[xs_id] = np.vstack([heyc, tp, wp, area])
 
     def convey_table_calc(self):
+        """conveyance K(h) of every node. Up to the bank height H: the section of the xs file. Above it, a compound
+        section: the trapezoidal main channel (bottom width b, top width tw at H) and overbank beds rising from H at
+        the banks to H + dH at the valley walls (lateral slope dH / Lo, Lo = (twcc - tw) / 2 on each side), then
+        vertical walls; the overbank roughness is twice the channel roughness (NWM nCC = 2 n)."""
         self.conveyTable = []
-        NN = 300
-
         for i in range(self.nodeNo):
             xs_id = self.geo['xsInfo'][i]
-            xs = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(xs_id))
+            xs = self._read_xs(xs_id)
             max_h = xs[-1][0]
-            heyc = np.linspace(0, max_h, NN + 1)
-
+            heyc = np.linspace(0, max_h, N_TABLE + 1)
             H = xs[1, 0]
-            twcc = xs[-1,2] - xs[-1,1]
-            b = xs[0,2] - xs[0,1]
-            idx_mid = int(len(xs[:,0])/2)
-            tw = xs[idx_mid-1,2] - xs[idx_mid-1,1]
-            Acc = (twcc - tw) * (heyc - H)
+            dH = xs[2, 0] - xs[1, 0]
+            twcc = xs[-1, 2] - xs[-1, 1]
+            b = xs[0, 2] - xs[0, 1]
+            tw = xs[1, 2] - xs[1, 1]
+            Lo = (twcc - tw) / 2
+            y = heyc - H
+            ramp = y <= dH
+            Acc = np.where(ramp, (twcc - tw) * y ** 2 / (2 * dH), (twcc - tw) * (y - dH / 2))
+            sl = np.sqrt(1 + (dH / Lo) ** 2)      # length of the sloped overbank bed per unit horizontal width
+            wpcc = np.where(ramp, 2 * Lo * y / dH * sl, 2 * Lo * sl + 2 * (y - dH))
             A = (b + tw) * H / 2 + tw * (heyc - H)
-            wpcc = 2 * (heyc - H) + twcc - tw
             wp = tw
             rcc = Acc / wpcc
             r = A / wp
-            k1 = A * r ** (2/3) / self.geo['mannings_n'][i]
-            k2 = Acc * rcc ** (2/3) / self.geo['mannings_n'][i] / 2 ## ncc is mostly regular mannings doubled, that's why /2
-
-            cc = np.zeros((len(heyc),2))
+            k1 = A * r ** (2 / 3) / self.geo['mannings_n'][i]
+            k2 = Acc * rcc ** (2 / 3) / self.geo['mannings_n'][i] / 2         # overbank n = 2 n
+            cc = np.zeros((len(heyc), 2))
             cc[:, 0] = heyc
             mask = heyc <= H
-            cc[mask, 1] = self.xsParams[xs_id][3,mask] * (self.xsParams[xs_id][3,mask] / self.xsParams[xs_id][2,mask]) ** (2 / 3) / self.geo['mannings_n'][i]
+            A_xs, P_xs = self.xsParams[xs_id][3, mask], self.xsParams[xs_id][2, mask]
+            cc[mask, 1] = A_xs * (A_xs / P_xs) ** (2 / 3) / self.geo['mannings_n'][i]
             cc[~mask, 1] = k1[~mask] + k2[~mask]
             self.conveyTable.append(cc)
 
     def qbar_cbar_dbar_save(self):
+        """bar_params[i]: rows (depth grid, Qbar, Cbar, Dbar, dDbar/dQbar) of node i, uniform flow at the depth:
+        Qbar = K sqrt(S0), Cbar = dQbar/dh / B, Dbar = Qbar / (2 B S0)"""
         self.bar_params = [None] * self.nodeNo
-        NN = 300
-
         for i in range(self.nodeNo):
-            # if i == 52:
-            #     continue
             xs_id = self.geo['xsInfo'][i]
-            max_h = np.loadtxt(self.caseName + '/segment' + str(self.segmentNo) + '/geo/xSecs/xs' + str(xs_id))[-1][0]
-            heyc = np.linspace(0, max_h, NN + 1)
-            hdif = max_h / NN
-
+            max_h = self._read_xs(xs_id)[-1][0]
+            heyc = np.linspace(0, max_h, N_TABLE + 1)
+            hdif = max_h / N_TABLE
             qbar = np.zeros(len(heyc))
             dqbar_dh = np.zeros(len(heyc))
             cbar = np.zeros(len(heyc))
             dbar = np.zeros(len(heyc))
             ddbar_dqbar = np.zeros(len(heyc))
-            # qbar[:] = self.xsParams[xs_id][3, :] * (self.xsParams[xs_id][3, :] / self.xsParams[xs_id][2, :] ) ** (2/3) * np.sqrt(self.geo['slopes'][i]) / self.geo['mannings_n'][i]
-            qbar[:] = np.sqrt(self.geo['slopes'][i]) * self.conveyTable[i][:,1]
-            '''dqbardh'''
-            # dqbar_dh[1:-1] = (qbar[2:] - qbar[:-2]) / 2 / hdif
-            ''''''
+            qbar[:] = np.sqrt(self.geo['slopes'][i]) * self.conveyTable[i][:, 1]
+            # dQbar/dh: fourth-order central differences, second order next to the ends, one-sided at the ends
             dqbar_dh[2:-2] = (-qbar[4:] + 8 * qbar[3:-1] - 8 * qbar[1:-3] + qbar[0:-4]) / 12 / hdif
             dqbar_dh[1] = (qbar[2] - qbar[0]) / 2 / hdif
             dqbar_dh[-2] = (qbar[-1] - qbar[-3]) / 2 / hdif
-            ''''''
             dqbar_dh[0] = (qbar[1] - qbar[0]) / hdif
             dqbar_dh[-1] = (qbar[-1] - qbar[-2]) / hdif
-            ''''''
-            # dqbar_dh[:] = 5 / 3 * heyc[:] ** (2/3) * self.xsParams[xs_id][1, :] * np.sqrt(self.geo['slopes'][i]) / self.geo['mannings_n'][i]
             cbar[:] = dqbar_dh[:] / self.xsParams[xs_id][1, :]
             dbar[:] = qbar[:] / 2 / self.xsParams[xs_id][1, :] / self.geo['slopes'][i]
-            ddbar_dqbar[:] = 1 / 2 / self.xsParams[xs_id][1, :] / self.geo['slopes'][i]
-
+            # dDbar/dQbar along the tabulated relations Dbar(h) and Qbar(h) (B changes with h, so this is not
+            # 1 / (2 B S0), and C keeps both terms of Cappelaere 1997, Eq. 14a)
+            ddbar_dqbar[:] = np.gradient(dbar, heyc) / np.gradient(qbar, heyc)
             self.bar_params[i] = np.vstack([heyc, qbar, cbar, dbar, ddbar_dqbar])
 
-        # plt.plot(qbar, cbar)
-        # plt.plot(qbar, dbar/10/qbar)
-        # plt.show()
-        # np.savetxt('../Research/Diffusive Wave RBFCM/Q vs CD/qbar_cdbar', np.vstack([qbar,cbar, dbar]))
-
+    # ---- boundary values -------------------------------------------------------------------------------------------
     def read_upstream_Q(self, time):
-        if self._upQ_series is not None:
-            # junction: sum of the upstream segments' outflow, kept in memory by Network
+        if self._upQ_series is not None:          # junction: sum of the outflows of the channels draining into it
             return self._upQ_series.value_at(time)
-        # external hydrograph: loaded once in initialize_conditions (the file does not change during a run)
-        Q_interp = np.interp(time, self.Q_boundaries[:, 0], self.Q_boundaries[:, 1])
-
-        return Q_interp
+        return np.interp(time, self.Q_boundaries[:, 0], self.Q_boundaries[:, 1])      # inflow hydrograph
 
     def read_downstream_h(self, time):
-        if self._dsh_series is not None:
-            # junction: h at the upstream end of the downstream segment, kept in memory by Network
+        if self._dsh_series is not None:          # junction: depth at the upstream end of the downstream channel
             return self._dsh_series.value_at(time)
-        if self._h_boundaries is None:
-            # external water levels: read once, then reused
+        if self._h_boundaries is None:            # outlet: prescribed depth (boundary_h)
             self._h_boundaries = np.atleast_2d(np.loadtxt(self.geom_path + 'boundary_h'))
-
-        # Interpolate Q for the given time
-        h_interp = np.interp(time, self._h_boundaries[:, 0], self._h_boundaries[:, 1])
-
-        return h_interp
+        return np.interp(time, self._h_boundaries[:, 0], self._h_boundaries[:, 1])

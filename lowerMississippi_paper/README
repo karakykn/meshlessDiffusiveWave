@@ -1,0 +1,16 @@
+Lower Mississippi River (LMR), 2011 flood: Tarbert Landing - Head of Passes as one channel.
+
+Nodes: 96, at the boundaries of the National Water Model (NWM) reaches; reaches shorter than 1 km merged with the
+downstream reach and reaches longer than 10 km halved (spacing 1.18-9.85 km; segment0/geo/nwm_nodes.csv lists the
+NWM link of every node). One cross-section (NWM link 19086929): trapezoidal main channel up to the bank height
+H = (TopWdth - BtmWdth) ChSlp / 2 = 6.48 m, overbank bed with a lateral slope of 1:100.
+Inflow at Tarbert Landing (segment0/geo/boundary_Q). Outlet: depth at Head of Passes, h(t) = h_n(Q(0)) + stage(t)
+- stage(0), h_n = 19.703 m the normal depth of the initial discharge (segment0/geo/boundary_h).
+Spillways as point lateral outflows (segment0/geo/laterals and lateralDatas): Morganza x = 38.0 km, Bonnet Carre
+283.4 km, Bohemia 390.0 km.
+c / r_av = 64 (shape), theta = 0.5, Courant number 1.
+Gauges: Baton Rouge node 28 (115.9 km), Belle Chasse node 72 (362.3 km).
+
+data/: USGS daily discharge at the gauges and the CNS results of Beg et al. (2023).
+scripts/boundary_figure.py -> ex3_inflow, ex3_lateral; scripts/hydrograph_figure.py -> ex3_1, ex3_2;
+scripts/hydrographs_meshless.csv: meshless discharge at the gauges at every time step.

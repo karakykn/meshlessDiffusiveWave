@@ -1,0 +1,6 @@
+Scripts of the paper that do not belong to one case folder (run from any folder):
+  table_metrics.py          error metrics of Table 4 (prints them, writes table_error_summary.tex)
+  make_B1_full.py           Fig. S8, full shape-parameter figure, from sensitivity/B1_final_model/B1_results.csv
+  fig_lateral_response.py   Fig. S6, response of the discharge to a point lateral outflow
+  lmr_profiles.py           LMR run (copy of the case) -> lmr_profiles.csv, lmr_series.csv
+  fig_lateral_lmr.py        Fig. S7, lateral outflows on the LMR, from lmr_profiles.csv and lmr_series.csv

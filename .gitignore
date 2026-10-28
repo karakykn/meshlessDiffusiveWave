@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+# per-run folders of the sensitivity sweeps (process_B1.py, process_B2.py) and timing logs (time_meshless.py)
+sensitivity/*/runs/
+*/cpu_run_*.log

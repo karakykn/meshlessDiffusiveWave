@@ -1,11 +1,11 @@
 CFL
-0.99
+1
 
 RBFtype (0=TPS, 1=MQ, 2=IMQ, MQ recommended)
 1
 
 shape parameter coefficient (c = x r_av), x:
-5000
+32
 
 simEndTime (seconds)
 31536000

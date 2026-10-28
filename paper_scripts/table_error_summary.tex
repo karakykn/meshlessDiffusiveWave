@@ -1,0 +1,40 @@
+\begin{table}[htbp]
+\caption{Error metrics at the control points (Section~\ref{sec:errors}). $N$: total number of nodes. Differences are model minus reference. The reference is HEC-RAS for the single channel, the dynamic wave solution of Akan and Yen (1981) for the backwater network, and the USGS gage record for the LMR and Midwest 2008. Bold: better value at the location.}
+\label{tab:error-summary}
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llrrlrrrrr}
+\toprule
+Case & Model & $N$ & Runtime & Location & MPE & MBE & \multicolumn{2}{c}{$\Delta Q_p$} & $\Delta t_a$ \\
+\cmidrule(lr){8-9}
+ & & & (s) & & (\%) & (\%) & (m$^3$/s) & (\%) & (h) \\
+\midrule
+Single channel & CNS & 21 &  & Ds. end & $1.02$ & $-0.04$ & $+2.06$ & $+9.7$ & $+0.83$ \\
+\cmidrule(l){2-10}
+ & Meshless & 21 &  & Ds. end & \boldmath$0.05$ & \boldmath$0.00$ & \boldmath$-0.07$ & \boldmath$-0.3$ & \boldmath$0.00$ \\
+\midrule
+Backwater network & CNS & 66 &  & Ch. 1 ds. end & $6.62$ & $-1.22$ & $+1.16$ & $+11.8$ & \boldmath$-0.001$ \\
+ &  &  &  & Ch. 2 ds. end & $21.06$ & $+1.21$ & $-0.51$ & $-20.3$ & \boldmath$nan$ \\
+ &  &  &  & Ch. 6 ds. end & $9.02$ & $-0.17$ & $+4.59$ & $+23.8$ & $-0.007$ \\
+\cmidrule(l){2-10}
+ & Meshless & 66 &  & Ch. 1 ds. end & \boldmath$3.96$ & \boldmath$+0.01$ & \boldmath$+0.65$ & \boldmath$+6.6$ & $-0.013$ \\
+ &  &  &  & Ch. 2 ds. end & \boldmath$5.46$ & \boldmath$+0.03$ & \boldmath$+0.15$ & \boldmath$+5.9$ & $nan$ \\
+ &  &  &  & Ch. 6 ds. end & \boldmath$2.59$ & \boldmath$+0.05$ & \boldmath$+0.88$ & \boldmath$+4.6$ & \boldmath$-0.004$ \\
+\midrule
+LMR & CNS & 97 &  & Baton Rouge & $4.98$ & \boldmath$+0.11$ & $+5318$ & $+13.1$ & \boldmath$-6$ \\
+ &  &  &  & Belle Chasse & $9.42$ & $+2.35$ & \boldmath$-67$ & \boldmath$-0.2$ & $+43$ \\
+\cmidrule(l){2-10}
+ & Meshless & 96 &  & Baton Rouge & \boldmath$3.93$ & $+1.50$ & \boldmath$+501$ & \boldmath$+1.2$ & $-6$ \\
+ &  &  &  & Belle Chasse & \boldmath$5.95$ & \boldmath$+0.38$ & $-297$ & $-0.8$ & \boldmath$+12$ \\
+\midrule
+Midwest 2008 & CNS & 109 &  & Grafton & $10.88$ & \boldmath$+3.64$ & $+2243$ & $+18.0$ & \boldmath$-10$ \\
+ &  &  &  & St. Charles & $6.29$ & \boldmath$+3.98$ & \boldmath$-596$ & \boldmath$-6.9$ & $+17$ \\
+ &  &  &  & St. Louis & $9.57$ & \boldmath$+3.17$ & $+2375$ & $+11.7$ & $+11$ \\
+\cmidrule(l){2-10}
+ & Meshless & 109 &  & Grafton & \boldmath$9.99$ & $+3.81$ & \boldmath$+1751$ & \boldmath$+14.1$ & $-19$ \\
+ &  &  &  & St. Charles & \boldmath$5.51$ & $+4.31$ & $-819$ & $-9.5$ & \boldmath$+9$ \\
+ &  &  &  & St. Louis & \boldmath$9.10$ & $+3.37$ & \boldmath$+1333$ & \boldmath$+6.6$ & \boldmath$+7$ \\
+\bottomrule
+\end{tabular}
+\end{table}

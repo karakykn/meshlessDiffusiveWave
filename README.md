@@ -1,53 +1,68 @@
-Author: Ismet Karakan
-Contact: karakan@sc.edu
+# Meshless diffusive wave model for flood routing in channel networks
 
-This code models given single channel, or channel network
-with meshless RBFCM. The governing equation for the discharge
-is variable parameter advection-diffusion. The governing equation
-for water depths is dh/dx = S_0 - S_f. 
+Code and results of
 
---------------------pre process--------------------------
-Create a directory for the case (eg. syntheticNetwork)
-For each segment in the network, create directories under the case directory
-named 'segmentx' where x is the segment id. Under each segment directory,
-create a 'geo' directory to keep geometry related files and boundary files, 
-and a 'run' file to feed the model with initial conditions and keep the record
-of model results with specified print step.
-----geo---
-nodes: the position of nodes in the river segment.
-slopes: slopes.
-mannings_n: mannings.
-xsInfo: cross section information for each node, this array directs correct cs for that node.
-xs0 (or xs1, xs2): cross section data (y, x1, x2)
-boundary_h: downstream water levels for the segment. If the segment has any downstream segment,
-          the upstream water level of downstream segment is assigned for the downstream value
-          of the upper segment. If not, downstream water levels are interpolated by this
-          file. (time h)
-boundary_Q: upstream discharge for the segment. If the segment has any upstream segment,
-          the downstream values of discharges of the immediate upstream segments are summed,
-          and assigned for the upstream discharge for the current segment. If not, the upstream
-          discharge is interpolated by this file. (time, Q)
----run---
-{time}/h.csv: water levels for given time.
-{time}/Q.csv: discharge for given time.
+> Karakan, I., Jamal, J. F., Goharian, E., Chaudhry, M. H., and Imran, J. "Meshless solution of the diffusive wave
+> equation for flood routing in channel networks." *Journal of Hydraulic Engineering* (manuscript HYENG-15162,
+> under review).
 
----input---
-This file has to stay directly under the case name. Keeps the necessary information for the model.
----network---
-This file keeps the information for channel network. connections are defined as the upstream segment and
-downstream segment. For example in 'syntheticNetwork' case, network is:
-0 2
-1 2
-which implies there is a junction between segment 0 and 2, and segment 0 is the upstream segment. Similarly,
-the second entry implies there is a junction between segment 1 and 2, and segment 1 is the upstream segment.
-This example case is a simple Y shaped channel network.
-------------------------------------------------------------------
+Contact: Ismet Karakan, karakan@sc.edu
 
---------------------------process---------------------------------
-After setting the case completly with the steps explained above, run process.py. Make sure the caseName is entered
-correctly.
--------------------------------------------------------------------
+The model solves the diffusive wave equation for the discharge with Kansa's radial basis function collocation
+method (multiquadric basis) and the theta (Crank-Nicolson) time scheme, on a single channel or a dendritic channel
+network. Flow depths follow from the zero-inertia momentum equation; junctions are coupled through the volume
+balance of the channels draining into them. The equations and the solution procedure are summarized at the top of
+`source.py`.
 
---------------------post process----------------------------------
-post_process.m helps the user visualize the downstream and upstream values of each segment versus time.
----------------------------------------------------------------------
+## Requirements
+
+Python 3 with NumPy for the model (`source.py`, `process.py`). The figure, table and sensitivity scripts also need
+Matplotlib and pandas.
+
+## Running a case
+
+From this folder:
+
+    python process.py syntheticChannel          # single channel (verification)
+    python process.py akanYenNetwork            # backwater network of Akan and Yen (1981) (verification)
+    python process.py lowerMississippi_paper    # Lower Mississippi River, 2011 (validation)
+    python process.py 2008flood_stLouis         # Midwest flood, 2008 (validation)
+
+Results are written to `<case>/segment<i>/run/<time>/Q` and `h` (discharge and depth at the nodes). The folders in
+this repository hold the results of these runs.
+
+## Case folder
+
+| File | Content |
+| --- | --- |
+| `input` | Courant number; basis type (1: multiquadric); shape parameter coefficient c / r_av (used without a `shape` file); end time (s); print step (time steps between written results); outlet condition (0: normal depth, 1: depth from `boundary_h`) |
+| `network` | one row `upstream downstream` for every pair of channels joined at a junction (`0 -1` for a single channel) |
+| `shape` | c / r_av of every channel (segment order), selected by `select_shape.py` |
+| `segment<i>/geo/nodes`, `slopes`, `mannings_n` | node positions (m), bed slope and Manning's n at the nodes |
+| `segment<i>/geo/xsInfo`, `xSecs/xs<k>` | cross-section number of every node; cross-sections as rows (height above the bed, left bank x, right bank x) |
+| `segment<i>/geo/boundary_Q`, `boundary_h` | inflow hydrograph [t (s), Q (m3/s)] of a channel without upstream channels; depth [t (s), h (m)] at the outlet. For channels at a junction the model writes the junction values here. |
+| `segment<i>/geo/laterals`, `lateralDatas/` | point lateral flows (name, x, file); files hold [t (s), Q (m3/s)], negative for an outflow |
+| `segment<i>/run/0/Q`, `h` | initial discharge and depth |
+
+## Paper figures and tables
+
+| Item | Script | Data |
+| --- | --- | --- |
+| Table 2 (shape parameter) | `select_shape.py` | case `shape` files, `sensitivity/shape_selection/` |
+| Table 4 (error metrics) | `paper_scripts/table_metrics.py` | stored hydrographs, `<case>/data/` |
+| Fig. 2 | `syntheticChannel/scripts/plot_single.py` | HEC-RAS and CNS series in `syntheticChannel/data/` |
+| Fig. 3, Fig. S8 | `process_B1.py`, `paper_scripts/make_B1_full.py` | `sensitivity/B1_final_model/` |
+| Fig. 4 | `process_B2.py` | `sensitivity/B2_final_model/` |
+| Fig. 5 | `akanYenNetwork/scripts/hydrograph_figure.py` | `akanYenNetwork/data/` |
+| Figs. 7 and 8 | `lowerMississippi_paper/scripts/boundary_figure.py`, `hydrograph_figure.py` | `lowerMississippi_paper/data/` |
+| Figs. 10 and 11 | `2008flood_stLouis/scripts/boundary_figure.py`, `hydrograph_figure.py` | `2008flood_stLouis/data/` |
+| Figs. S6 and S7 | `paper_scripts/fig_lateral_response.py`, `paper_scripts/lmr_profiles.py`, `fig_lateral_lmr.py` | `paper_scripts/` |
+| CPU times of the LMR and Midwest cases (Table 4) | `time_meshless.py` | `timing_meshless.csv` |
+
+The hydrograph scripts use the stored model series (`<case>/scripts/hydrographs_meshless.csv`) and rerun the model
+with `--run`. The sweep scripts redraw their figures from the stored results with `--plot-only`; without it they
+run the sweep (`--help` lists the options). `figure_tools.py` and `paper_style.py` hold the common figure code and
+style. `akanYenNetwork/scripts/make_akanYen.py` builds the case folder of the backwater network. CNS results
+(Beg et al. 2023, and the CNS runs on the inputs of these cases) are included as data; the CNS code is not part of
+this repository, nor are the timing runs of Fig. 12 and the CPU times of the verification cases, which were run
+together with CNS.
